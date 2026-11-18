@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install the packages of the target
         if: matrix.packages != ''
@@ -79,7 +79,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/evans" "stage/${{ matrix.arch }}/bin/evans"
 
       - name: Upload the binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.arch }}
           path: stage/${{ matrix.arch }}/bin/evans
@@ -98,10 +98,10 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download the binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: binary-*
           path: bin
@@ -184,7 +184,7 @@ jobs:
           cat "dist/$(basename "$TARGET").sha256"
 
       - name: Upload the package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: package-${{ matrix.packager }}-${{ matrix.arch }}
           path: |
@@ -203,7 +203,7 @@ jobs:
 
     steps:
       - name: Download the packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: package-*
           path: dist
