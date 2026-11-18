@@ -121,5 +121,6 @@ jobs:
             gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
           else
             gh release create "$TAG" dist/*.tar.gz dist/*.sha256 \
-              --generate-notes --title "$TAG" --verify-tag
+              --generate-notes --title "$TAG" --verify-tag \
+              || gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
           fi

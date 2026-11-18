@@ -1,0 +1,240 @@
+name: package
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
+      - "proto/**"
+      - "packaging/**"
+      - ".github/workflows/package.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # nfpm builds the deb, the rpm and the Arch Linux package for all the targets.
+  NFPM_VERSION: "2.49.0"
+  NFPM_SHA256: 2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            linker: cc
+            packages: ""
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            linker: aarch64-linux-gnu-gcc
+            packages: gcc-aarch64-linux-gnu
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the packages of the target
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends ${{ matrix.packages }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up the linker and the C compiler of the target
+        env:
+          TARGET: ${{ matrix.target }}
+          LINKER: ${{ matrix.linker }}
+        run: |
+          # The environment variables of the linker and of the C compiler are named
+          # after the target, e.g. CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER.
+          suffix=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${suffix}_LINKER=${LINKER}" >> "$GITHUB_ENV"
+          echo "CC_${suffix}=${LINKER}" >> "$GITHUB_ENV"
+
+      - name: Build the binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage the binary
+        run: |
+          mkdir -p "stage/${{ matrix.arch }}/bin"
+          cp "target/${{ matrix.target }}/release/evans" "stage/${{ matrix.arch }}/bin/evans"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: stage/${{ matrix.arch }}/bin/evans
+          if-no-files-found: error
+
+  package:
+    name: ${{ matrix.packager }} ${{ matrix.arch }}
+    needs: build
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        packager: [deb, rpm, archlinux]
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Download the binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: bin
+
+      - name: Install nfpm
+        run: |
+          curl -sSfL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  /tmp/nfpm.tar.gz" | sha256sum --check --strict
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/nfpm.tar.gz -C "$HOME/.local/bin" nfpm
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          nfpm --version
+
+      - name: Build the package
+        id: package
+        env:
+          ARCH: ${{ matrix.arch }}
+          PACKAGER: ${{ matrix.packager }}
+        run: |
+          version=$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          export VERSION="${version}"
+
+          mkdir -p dist/bin dist/share
+          cp "bin/binary-${ARCH}/evans" dist/bin/evans
+          cp README.md dist/share/README.md
+
+          # The license file is not always committed to the repository, so fall
+          # back to the license section of the README.
+          if [ -f LICENSE ]; then
+            cp LICENSE dist/share/LICENSE
+          else
+            sed -n '/^## License/,$p' README.md > dist/share/LICENSE
+          fi
+
+          case "$PACKAGER" in
+            deb)
+              target="dist/evans_${version}_${ARCH}.deb"
+              ;;
+            rpm)
+              case "$ARCH" in
+                amd64) arch=x86_64 ;;
+                arm64) arch=aarch64 ;;
+              esac
+              target="dist/evans-${version}-1.${arch}.rpm"
+              ;;
+            archlinux)
+              case "$ARCH" in
+                amd64) arch=x86_64 ;;
+                arm64) arch=aarch64 ;;
+              esac
+              target="dist/evans-${version}-1-${arch}.pkg.tar.zst"
+              ;;
+          esac
+
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+          nfpm package \
+            --packager "$PACKAGER" \
+            --config packaging/nfpm.yaml \
+            --target "$target"
+
+      - name: Check the package
+        env:
+          TARGET: ${{ steps.package.outputs.target }}
+        run: |
+          ls -l "$TARGET"
+          case "$TARGET" in
+            *.deb)
+              ar t "$TARGET"
+              ;;
+            *.rpm)
+              if command -v bsdtar > /dev/null; then
+                bsdtar -tf "$TARGET"
+              else
+                rpm -qp --list "$TARGET"
+              fi
+              ;;
+            *.pkg.tar.zst)
+              zstd -dc "$TARGET" | tar -tf -
+              ;;
+          esac
+
+      - name: Checksum the package
+        env:
+          TARGET: ${{ steps.package.outputs.target }}
+        run: |
+          (cd dist && sha256sum "$(basename "$TARGET")" > "$(basename "$TARGET").sha256")
+          cat "dist/$(basename "$TARGET").sha256"
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.packager }}-${{ matrix.arch }}
+          path: |
+            ${{ steps.package.outputs.target }}
+            ${{ steps.package.outputs.target }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish the packages
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: List the packages
+        run: ls -l dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The release itself is created by the release workflow, so wait for it.
+          for _ in $(seq 1 60); do
+            if gh release view "$TAG" > /dev/null 2>&1; then
+              break
+            fi
+            sleep 10
+          done
+
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --generate-notes --title "$TAG" --verify-tag || true
+          fi
+
+          gh release upload "$TAG" \
+            dist/*.deb dist/*.rpm dist/*.pkg.tar.zst dist/*.sha256 \
+            --clobber

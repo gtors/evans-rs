@@ -157,13 +157,20 @@ test proto in `testdata/proto/test.proto`.
 The GitHub Actions workflows build the binary for Linux and package it for every
 supported architecture:
 
-| Target | Architecture | Package |
-|--------|--------------|---------|
-| `x86_64-unknown-linux-gnu` | x86_64 | `evans-<version>-linux-x86_64.tar.gz` |
+| Target | Architecture | Packages |
+|--------|--------------|----------|
+| `x86_64-unknown-linux-gnu` | x86_64 | `evans-<version>-linux-x86_64.tar.gz`, `evans_<version>_amd64.deb`, `evans-<version>-1.x86_64.rpm`, `evans-<version>-1-x86_64.pkg.tar.zst` |
 | `x86_64-unknown-linux-musl` | x86_64 | `evans-<version>-linux-x86_64-musl.tar.gz` |
+| `aarch64-unknown-linux-gnu` | aarch64 | `evans_<version>_arm64.deb`, `evans-<version>-1.aarch64.rpm`, `evans-<version>-1-aarch64.pkg.tar.zst` |
 
 Every package contains the `evans` binary and its README, and it is published with a
 SHA-256 checksum. Pushing a `v*` tag publishes the packages as a GitHub release.
+
+The native packages are built with [nfpm](https://nfpm.goreleaser.com) from
+`packaging/nfpm.yaml`, so a single configuration describes the deb, the rpm and the
+package for Arch Linux at once. The `package` workflow builds them on every push and
+on every pull request that touches the sources, and attaches them to the release of a
+`v*` tag.
 
 ## License
 
