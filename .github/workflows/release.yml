@@ -76,7 +76,7 @@ jobs:
           cp README.md "dist/${name}/README.md"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
-          echo "name=${name}" >> "$GITHUB_ENV"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "The package is dist/${name}.tar.gz"
 
       - name: Check the package
