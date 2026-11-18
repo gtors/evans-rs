@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package other;
+
+// The service and the messages share their short names with the ones of test.proto,
+// so the short names are ambiguous.
+service APIService {
+  rpc Unary(UnaryRequest) returns (UnaryResponse);
+}
+
+message UnaryRequest {}
+
+message UnaryResponse {}

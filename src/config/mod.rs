@@ -30,8 +30,6 @@ pub struct Config {
 pub struct DefaultConfig {
     pub proto_path: Vec<String>,
     pub proto_file: Vec<String>,
-    pub package: String,
-    pub service: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,7 +85,7 @@ impl Default for MetaConfig {
 impl Default for ReplConfig {
     fn default() -> Self {
         Self {
-            prompt_format: "{package}.{service}@{addr}:{port}".to_string(),
+            prompt_format: "{addr}:{port}".to_string(),
             input_prompt_format: "{ancestor}{name} ({type}) => ".to_string(),
             colored_output: true,
             silent: false,
@@ -186,35 +184,25 @@ pub(crate) fn from_files(global: Option<&Path>, local: Option<&Path>, cli: &Cli)
     for (k, v) in flag_headers {
         cfg.request.header.entry(k).or_default().extend(v);
     }
+    // The boolean flags are switches, so they can only turn a setting on. They are
+    // merged with the config instead of overriding it.
+    cfg.server.reflection |= common.reflection;
+    cfg.server.tls |= common.tls;
+    cfg.repl.silent |= common.silent;
     cfg.validate()?;
     Ok(cfg)
 }
 
 fn flag_overrides(common: &Common) -> Vec<(&'static str, Value)> {
     let mut out = Vec::new();
-    if let Some(v) = &common.package {
-        out.push(("default.package", Value::from(v.as_str())));
-    }
-    if let Some(v) = &common.service {
-        out.push(("default.service", Value::from(v.as_str())));
-    }
     if let Some(v) = &common.host {
         out.push(("server.host", Value::from(v.as_str())));
     }
     if let Some(v) = &common.port {
         out.push(("server.port", Value::from(v.as_str())));
     }
-    if let Some(v) = common.reflection {
-        out.push(("server.reflection", Value::from(v)));
-    }
-    if let Some(v) = common.tls {
-        out.push(("server.tls", Value::from(v)));
-    }
     if let Some(v) = &common.servername {
         out.push(("server.name", Value::from(v.as_str())));
-    }
-    if let Some(v) = common.silent {
-        out.push(("repl.silent", Value::from(v)));
     }
     if let Some(v) = &common.cacert {
         out.push(("request.caCertFile", Value::from(v.display().to_string())));
@@ -320,7 +308,7 @@ mod tests {
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.server.port, "50051");
         assert!(cfg.server.reflection);
-        assert_eq!(cfg.repl.prompt_format, "{package}.{service}@{addr}:{port}");
+        assert_eq!(cfg.repl.prompt_format, "{addr}:{port}");
         assert_eq!(
             cfg.request.header.get("grpc-client"),
             Some(&vec!["evans".to_string()])
@@ -334,13 +322,13 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "[server]\nhost = \"1.2.3.4\"\nport = \"1234\"\n[default]\npackage = \"pkg\"\nservice = \"svc\"\n",
+            "[server]\nhost = \"1.2.3.4\"\nport = \"1234\"\n[default]\nprotoFile = [\"a.proto\"]\n",
         )
         .unwrap();
         let cfg = from_files(Some(&path), None, &cli(&["-r"])).unwrap();
         assert_eq!(cfg.server.host, "1.2.3.4");
         assert_eq!(cfg.server.port, "1234");
-        assert_eq!(cfg.default.package, "pkg");
+        assert_eq!(cfg.default.proto_file, vec!["a.proto".to_string()]);
         assert_eq!(cfg.request.header.get("grpc-client").unwrap(), &["evans"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }

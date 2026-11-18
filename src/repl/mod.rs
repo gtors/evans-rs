@@ -8,13 +8,15 @@ use anyhow::{Result, anyhow};
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use crate::config::{Config, ServerConfig};
 use crate::grpc::{Client, Headers};
 use crate::idl::Idl;
+use crate::message::filler::{FillError, Prompter};
 use crate::present::response::ResponseSink;
 
-use completer::Completer;
+use completer::{Completer, CompletionContext};
 use session::{Session, TerminalSession};
 
 /// The name of the type of a field, like `repl/proto_commands.go` does.
@@ -92,10 +94,6 @@ pub struct CallOptions {
 
 /// The state of the REPL session.
 pub struct State {
-    /// The currently selected package.
-    pub package: String,
-    /// The currently selected service.
-    pub service: String,
     /// The headers that are sent with each request.
     pub headers: Headers,
     /// The previous request of each method, used by the `--repeat` option.
@@ -111,12 +109,16 @@ pub struct Repl<'a> {
     session: Box<dyn Session>,
     out: Box<dyn Write>,
     err: Box<dyn Write>,
+    /// The context of the completion, which is shared with the completer of the
+    /// session.
+    completion: Arc<RwLock<CompletionContext>>,
 }
 
 impl<'a> Repl<'a> {
     /// Creates a new REPL.
     pub fn new(cfg: &'a Config, idl: &'a Idl, client: &'a mut Client) -> Result<Self> {
-        let completer = Completer::new(idl.clone());
+        let completion = Arc::new(RwLock::new(CompletionContext::default()));
+        let completer = Completer::new(idl.clone(), completion.clone());
         let session = TerminalSession::new(
             Box::new(completer),
             history_size(cfg),
@@ -128,17 +130,16 @@ impl<'a> Repl<'a> {
             idl,
             client,
             state: State {
-                package: cfg.default.package.clone(),
-                service: cfg.default.service.clone(),
                 headers: Headers::new(cfg.request.header.clone()),
                 requests: HashMap::new(),
             },
             session: Box::new(session),
             out: Box::new(std::io::stdout()),
             err: Box::new(std::io::stderr()),
+            completion,
         };
 
-        repl.validate_selection()?;
+        repl.sync_completion_context();
 
         Ok(repl)
     }
@@ -155,17 +156,16 @@ impl<'a> Repl<'a> {
             idl,
             client,
             state: State {
-                package: cfg.default.package.clone(),
-                service: cfg.default.service.clone(),
                 headers: Headers::new(cfg.request.header.clone()),
                 requests: HashMap::new(),
             },
             session,
             out: Box::new(std::io::stdout()),
             err: Box::new(std::io::stderr()),
+            completion: Arc::new(RwLock::new(CompletionContext::default())),
         };
 
-        repl.validate_selection()?;
+        repl.sync_completion_context();
 
         Ok(repl)
     }
@@ -196,22 +196,6 @@ impl<'a> Repl<'a> {
         repl.out = out;
         repl.err = err;
         Ok(repl)
-    }
-
-    /// Checks that the preselected package and service exist.
-    fn validate_selection(&self) -> Result<()> {
-        if !self.state.package.is_empty() && !self.idl.list_packages().contains(&self.state.package)
-        {
-            return Err(anyhow!("unknown package name '{}'", self.state.package));
-        }
-        if !self.state.service.is_empty() {
-            let fqsn =
-                crate::idl::fully_qualified_service_name(&self.state.package, &self.state.service);
-            if self.idl.service(&fqsn).is_err() {
-                return Err(anyhow!("unknown service name '{}'", self.state.service));
-            }
-        }
-        Ok(())
     }
 
     /// Runs the read-eval-print loop.
@@ -292,15 +276,7 @@ impl<'a> Repl<'a> {
                     add_repeated_manually,
                     repeat,
                 };
-                self.call(&method, options).await?;
-                Ok(Outcome::Continue)
-            }
-            command::Parsed::Package(name) => {
-                self.use_package(&name)?;
-                Ok(Outcome::Continue)
-            }
-            command::Parsed::Service(name) => {
-                self.use_service(&name)?;
+                self.call(method.as_deref(), options).await?;
                 Ok(Outcome::Continue)
             }
             command::Parsed::Show(target) => {
@@ -321,43 +297,25 @@ impl<'a> Repl<'a> {
                     }
                     self.state.headers.add(&key, &value)?;
                 }
+                self.sync_completion_context();
                 Ok(Outcome::Continue)
             }
             command::Parsed::Exit => Ok(Outcome::Exit),
         }
     }
 
-    /// Selects a package.
-    fn use_package(&mut self, name: &str) -> Result<()> {
-        if !self.idl.list_packages().iter().any(|p| p == name) {
-            return Err(anyhow!("unknown package name '{name}'"));
-        }
-        self.state.package = name.to_string();
-        self.state.service.clear();
-        Ok(())
-    }
-
-    /// Selects a service.
-    fn use_service(&mut self, name: &str) -> Result<()> {
-        let services = self.idl.list_services();
-        let mut found = false;
-        for fqsn in &services {
-            let (pkg, svc) = crate::idl::parse_fully_qualified_service_name(fqsn);
-            if pkg != self.state.package {
-                continue;
-            }
-            found = true;
-            if svc == name || fqsn == name {
-                self.state.service = svc;
-                return Ok(());
-            }
-        }
-        if found {
-            return Err(anyhow!("unknown service name '{name}'"));
-        }
-        Err(anyhow!(
-            "package unselected. please execute 'package' command at the first"
-        ))
+    /// Keeps the context of the completion in sync with the state of the REPL.
+    fn sync_completion_context(&self) {
+        let Ok(mut context) = self.completion.write() else {
+            return;
+        };
+        context.header_keys = self
+            .state
+            .headers
+            .keys()
+            .into_iter()
+            .map(|key| key.to_string())
+            .collect();
     }
 
     /// Formats the resources of the given target.
@@ -427,17 +385,12 @@ impl<'a> Repl<'a> {
     ///
     /// Unlike the `desc` command of the CLI mode, the name of the message is relative
     /// to the selected package, like `usecase.GetTypeDescriptor` of the original does.
+    /// A fully-qualified name is resolved as it is.
     fn describe(&self, symbol: &str) -> Result<String> {
-        let fqmn = if symbol.starts_with(&format!("{}.", self.state.package)) {
-            symbol.to_string()
-        } else {
-            crate::idl::fully_qualified_service_name(&self.state.package, symbol)
-        };
-
         let desc = self
             .idl
-            .resolve_message(&fqmn)
-            .map_err(|_| anyhow!("failed to get the type descriptor of '{symbol}'"))?;
+            .resolve_message(symbol)
+            .map_err(|e| anyhow!("failed to get the type descriptor of '{symbol}': {e}"))?;
 
         let mut rows: Vec<Vec<String>> = desc
             .fields()
@@ -472,16 +425,8 @@ impl<'a> Repl<'a> {
         names.into_iter().collect()
     }
 
-    /// Lists the methods of the selected service, or of all services if none is selected.
+    /// Lists the methods of all the loaded services.
     fn list_methods(&self) -> Vec<prost_reflect::MethodDescriptor> {
-        let fqsn =
-            crate::idl::fully_qualified_service_name(&self.state.package, &self.state.service);
-        if !fqsn.is_empty()
-            && let Ok(methods) = self.idl.methods(&fqsn)
-        {
-            return methods;
-        }
-
         let mut methods = Vec::new();
         for service in self.idl.list_services() {
             if let Ok(mut svc_methods) = self.idl.methods(&service) {
@@ -492,14 +437,15 @@ impl<'a> Repl<'a> {
     }
 
     /// Calls the method.
-    async fn call(&mut self, method: &str, options: CallOptions) -> Result<()> {
-        let desc = self
-            .idl
-            .method(
-                &crate::idl::fully_qualified_service_name(&self.state.package, &self.state.service),
-                method,
-            )
-            .map_err(|e| anyhow!("failed to get the RPC descriptor for: {method}: {e}"))?;
+    ///
+    /// The method is selected from the loaded services if its name is omitted.
+    async fn call(&mut self, method: Option<&str>, options: CallOptions) -> Result<()> {
+        let mut prompter = self.session.prompter();
+
+        let desc = match method {
+            Some(name) => self.resolve_method(name)?,
+            None => self.select_method(prompter.as_mut())?,
+        };
 
         let fill_options = crate::message::filler::FillOptions {
             dig_manually: options.dig_manually,
@@ -509,7 +455,6 @@ impl<'a> Repl<'a> {
             add_repeated_manually: options.add_repeated_manually,
         };
 
-        let mut prompter = self.session.prompter();
         let mut filler = crate::message::filler::Filler::new(
             prompter.as_mut(),
             fill_options,
@@ -552,9 +497,57 @@ impl<'a> Repl<'a> {
         Ok(())
     }
 
+    /// Resolves the name of a method.
+    ///
+    /// A fully-qualified name is resolved as it is, while a short name is resolved
+    /// among the methods of the loaded services.
+    fn resolve_method(&self, name: &str) -> Result<prost_reflect::MethodDescriptor> {
+        self.idl
+            .resolve_method(name)
+            .map_err(|e| anyhow!("failed to get the RPC descriptor for: {name}: {e}"))
+    }
+
+    /// Selects a method from the loaded services.
+    fn select_method(
+        &self,
+        prompter: &mut dyn Prompter,
+    ) -> Result<prost_reflect::MethodDescriptor> {
+        let methods = self.list_methods();
+        if methods.is_empty() {
+            return Err(anyhow!("no RPC is available"));
+        }
+
+        let options: Vec<String> = methods
+            .iter()
+            .map(|method| {
+                format!(
+                    "{} ({})",
+                    method.full_name(),
+                    format_args!(
+                        "{} -> {}",
+                        method.input().full_name(),
+                        method.output().full_name()
+                    )
+                )
+            })
+            .collect();
+
+        let idx = match prompter.select_opt("select a method", &options) {
+            Ok(Some(idx)) => idx,
+            // The selection was canceled, either with ESC or with ctrl+c.
+            Ok(None) | Err(FillError::Abort) => return Err(anyhow!("inputting canceled")),
+            Err(err) => return Err(anyhow!("{err}")),
+        };
+
+        methods
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| anyhow!("no method is selected"))
+    }
+
     /// Makes the prompt of the REPL.
     fn make_prefix(&self) -> String {
-        build_prefix(&self.cfg.repl.prompt_format, &self.cfg.server, &self.state)
+        build_prefix(&self.cfg.repl.prompt_format, &self.cfg.server)
     }
 
     /// Prints the splash text.
@@ -589,22 +582,14 @@ fn history_size(cfg: &Config) -> usize {
 }
 
 /// Builds the prompt of the REPL from the configured format.
-fn build_prefix(format: &str, server: &ServerConfig, state: &State) -> String {
-    let dsn = if state.package.is_empty() {
-        state.service.clone()
-    } else if state.service.is_empty() {
-        state.package.clone()
-    } else {
-        format!("{}.{}", state.package, state.service)
-    };
-
-    // The package and the service are rendered as a single DSN so that an unset
-    // component does not leave a dangling separator behind.
+fn build_prefix(format: &str, server: &ServerConfig) -> String {
+    // The package and the service are not selected anymore, so their placeholders are
+    // replaced with nothing. They are kept for the sake of the older configurations.
     let prefix = format
-        .replace("{package}.{service}", &dsn)
-        .replace("{package}", &state.package)
-        .replace("{service}", &state.service)
-        .replace("{dsn}", &dsn)
+        .replace("{package}.{service}", "")
+        .replace("{package}", "")
+        .replace("{service}", "")
+        .replace("{dsn}", "")
         .replace("{addr}", &server.host)
         .replace("{port}", &server.port);
 
@@ -618,15 +603,6 @@ pub type ReplPrompt = prompt::InputPrompt;
 mod tests {
     use super::*;
 
-    fn state(package: &str, service: &str) -> State {
-        State {
-            package: package.to_string(),
-            service: service.to_string(),
-            headers: Headers::default(),
-            requests: HashMap::new(),
-        }
-    }
-
     fn server() -> ServerConfig {
         ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -637,31 +613,26 @@ mod tests {
 
     #[test]
     fn builds_the_prompt_of_the_repl() {
-        let format = "{package}.{service}@{addr}:{port}";
         assert_eq!(
-            build_prefix(format, &server(), &state("test", "APIService")),
-            "test.APIService@127.0.0.1:50051> "
-        );
-        // An unset component does not leave a dangling separator behind.
-        assert_eq!(
-            build_prefix(format, &server(), &state("test", "")),
-            "test@127.0.0.1:50051> "
-        );
-        assert_eq!(
-            build_prefix(format, &server(), &state("", "APIService")),
-            "APIService@127.0.0.1:50051> "
+            build_prefix("{addr}:{port}", &server()),
+            "127.0.0.1:50051> "
         );
     }
 
     #[test]
     fn builds_the_prompt_of_a_custom_format() {
         assert_eq!(
-            build_prefix(
-                "{package}/{service}@{addr}:{port}",
-                &server(),
-                &state("test", "APIService")
-            ),
-            "test/APIService@127.0.0.1:50051> "
+            build_prefix("{addr} -> {port}", &server()),
+            "127.0.0.1 -> 50051> "
+        );
+    }
+
+    #[test]
+    fn the_placeholders_of_the_removed_service_are_replaced_with_nothing() {
+        // The older configurations are kept working, but they show nothing.
+        assert_eq!(
+            build_prefix("{package}.{service}@{addr}:{port}", &server()),
+            "@127.0.0.1:50051> "
         );
     }
 }

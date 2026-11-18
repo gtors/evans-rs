@@ -5,7 +5,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "call",
         synopsis: "call a RPC",
-        help: "usage: call <method name>",
+        help: "usage: call [<method name>]\n\nThe method is selected from the loaded services if it is omitted.",
         flags: &[
             Flag {
                 name: "enrich",
@@ -72,18 +72,6 @@ pub const COMMANDS: &[Command] = &[
         }],
     },
     Command {
-        name: "package",
-        synopsis: "set a package as the currently selected package",
-        help: "usage: package <package name>",
-        flags: &[],
-    },
-    Command {
-        name: "service",
-        synopsis: "set the service as the current selected service",
-        help: "usage: service <service name>",
-        flags: &[],
-    },
-    Command {
         name: "show",
         synopsis: "show package, service or RPC names",
         help: "usage: show <package | service | message | rpc | header>",
@@ -108,7 +96,7 @@ pub struct Command {
 }
 
 /// The aliases of the commands.
-const ALIASES: &[(&str, &str)] = &[("quit", "exit")];
+pub const ALIASES: &[(&str, &str)] = &[("quit", "exit")];
 
 /// Looks up a command by its name.
 pub fn lookup(name: &str) -> Option<&'static Command> {
@@ -123,7 +111,8 @@ pub fn lookup(name: &str) -> Option<&'static Command> {
 #[derive(Debug)]
 pub enum Parsed {
     Call {
-        method: String,
+        /// The name of the method to call. It is selected interactively if it is omitted.
+        method: Option<String>,
         enrich: bool,
         emit_defaults: bool,
         dig_manually: bool,
@@ -133,8 +122,6 @@ pub enum Parsed {
         add_repeated_manually: bool,
         repeat: bool,
     },
-    Package(String),
-    Service(String),
     Show(String),
     Desc(String),
     Header(Vec<(String, String)>),
@@ -152,18 +139,6 @@ impl Command {
 pub fn parse(cmd: &Command, args: &[String]) -> anyhow::Result<Parsed> {
     match cmd.name {
         "call" => parse_call(args),
-        "package" => {
-            let name = args
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("argument required"))?;
-            Ok(Parsed::Package(name.clone()))
-        }
-        "service" => {
-            let name = args
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("argument required"))?;
-            Ok(Parsed::Service(name.clone()))
-        }
         "show" => {
             let target = args
                 .first()
@@ -253,8 +228,6 @@ fn parse_call(args: &[String]) -> anyhow::Result<Parsed> {
         }
         method = Some(arg);
     }
-
-    let method = method.ok_or_else(|| anyhow::anyhow!("argument required"))?;
 
     if bytes_from_file && (bytes_as_base64 || bytes_as_quoted_literals) {
         anyhow::bail!("only one of --bytes-from-file or --bytes-as-* can be specified");
@@ -431,7 +404,7 @@ mod tests {
                 emit_defaults,
                 ..
             } => {
-                assert_eq!(method, "Unary");
+                assert_eq!(method.as_deref(), Some("Unary"));
                 assert!(enrich);
                 assert!(emit_defaults);
             }

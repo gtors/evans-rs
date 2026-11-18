@@ -92,6 +92,15 @@ impl Prompter for InteractivePrompter {
     }
 
     fn select(&mut self, message: &str, options: &[String]) -> Result<usize, FillError> {
+        // A canceled selection falls back to the default value, like the original does.
+        Ok(self.select_opt(message, options)?.unwrap_or(0))
+    }
+
+    fn select_opt(
+        &mut self,
+        message: &str,
+        options: &[String],
+    ) -> Result<Option<usize>, FillError> {
         if options.is_empty() {
             return Err(FillError::Invalid("no options to select".to_string()));
         }
@@ -111,8 +120,7 @@ impl Prompter for InteractivePrompter {
         }
         .map_err(|e| FillError::Invalid(e.to_string()))?;
 
-        // ctrl+c aborts the selection and the default value is used.
-        Ok(selection.unwrap_or(0))
+        Ok(selection)
     }
 }
 

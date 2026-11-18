@@ -1034,7 +1034,6 @@ mod repl {
             default: evans2::config::DefaultConfig {
                 proto_path: vec![".".to_string()],
                 proto_file: vec!["testdata/proto/test.proto".to_string()],
-                ..Default::default()
             },
             server: evans2::config::ServerConfig {
                 host: ts.addr.ip().to_string(),
@@ -1097,28 +1096,44 @@ mod repl {
         let ts = spawn().await;
         // The request has the name, the repeated tags, the suit, the optional age, the
         // oneof body and the nested message. The empty answers use the default values.
-        let out = run_repl(
-            &ts,
-            &["package test", "service APIService", "call Simple"],
-            &["ktr"],
-            &[],
-        )
-        .await
-        .unwrap();
+        let out = run_repl(&ts, &["call test.APIService.Simple"], &["ktr"], &[])
+            .await
+            .unwrap();
         assert!(out.out.contains(r#""message": "ktr""#), "{out:?}");
     }
 
     #[tokio::test]
     async fn calls_a_unary_rpc_with_a_fully_qualified_service() {
         let ts = spawn().await;
-        run_repl(
-            &ts,
-            &["service test.APIService", "call Unary"],
-            &["ktr"],
-            &[0],
-        )
-        .await
-        .unwrap();
+        run_repl(&ts, &["call test.APIService.Unary"], &["ktr"], &[0])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn calls_a_rpc_with_its_fully_qualified_name() {
+        let ts = spawn().await;
+        let out = run_repl(&ts, &["call test.APIService.Simple"], &["ktr"], &[])
+            .await
+            .unwrap();
+        assert!(out.out.contains(r#""message": "ktr""#), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn selects_the_method_of_a_call_interactively() {
+        let ts = spawn().await;
+        // The method is not given, so it is selected from the loaded services. The
+        // fifth method of test.APIService is Simple, whose request has a single
+        // field.
+        let out = run_repl(&ts, &["call"], &["ktr"], &[4]).await.unwrap();
+        assert!(out.out.contains(r#""message": "ktr""#), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn reports_a_canceled_method_selection() {
+        let ts = spawn().await;
+        let out = run_repl(&ts, &["call"], &[], &[]).await.unwrap();
+        assert!(out.err.contains("inputting canceled"), "{out:?}");
     }
 
     #[tokio::test]
@@ -1154,10 +1169,20 @@ mod repl {
     }
 
     #[tokio::test]
-    async fn reports_an_unknown_package() {
+    async fn calls_a_rpc_with_its_short_name() {
         let ts = spawn().await;
-        let out = run_repl(&ts, &["package nope"], &[], &[]).await.unwrap();
-        assert!(out.err.contains("unknown package name 'nope'"), "{out:?}");
+        // The short name of a method is resolved when it is unique.
+        let out = run_repl(&ts, &["call Simple"], &["ktr"], &[])
+            .await
+            .unwrap();
+        assert!(out.out.contains(r#""message": "ktr""#), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn reports_an_unknown_method() {
+        let ts = spawn().await;
+        let out = run_repl(&ts, &["call Nope"], &[], &[]).await.unwrap();
+        assert!(out.err.contains("unknown method name 'Nope'"), "{out:?}");
     }
 
     #[tokio::test]
@@ -1171,14 +1196,9 @@ mod repl {
     #[tokio::test]
     async fn calls_a_server_streaming_rpc() {
         let ts = spawn().await;
-        let out = run_repl(
-            &ts,
-            &["package test", "service APIService", "call SimpleStream"],
-            &["ktr"],
-            &[],
-        )
-        .await
-        .unwrap();
+        let out = run_repl(&ts, &["call test.APIService.SimpleStream"], &["ktr"], &[])
+            .await
+            .unwrap();
         assert!(out.out.contains(r#""message": "ktr-0""#), "{out:?}");
         assert!(out.out.contains(r#""message": "ktr-2""#), "{out:?}");
     }
@@ -1188,11 +1208,7 @@ mod repl {
         let ts = spawn().await;
         let out = run_repl(
             &ts,
-            &[
-                "package test",
-                "service APIService",
-                "call SimpleClientStream",
-            ],
+            &["call test.APIService.SimpleClientStream"],
             &["a", "b"],
             &[],
         )
@@ -1206,12 +1222,7 @@ mod repl {
         let ts = spawn().await;
         let out = run_repl(
             &ts,
-            &[
-                "package test",
-                "service APIService",
-                "call Simple",
-                "call --repeat Simple",
-            ],
+            &["call test.APIService.Simple", "call --repeat Simple"],
             &["ktr"],
             &[],
         )
@@ -1223,14 +1234,9 @@ mod repl {
     #[tokio::test]
     async fn reports_an_error_when_repeating_an_unknown_request() {
         let ts = spawn().await;
-        let out = run_repl(
-            &ts,
-            &["package test", "service APIService", "call --repeat Simple"],
-            &[],
-            &[],
-        )
-        .await
-        .unwrap();
+        let out = run_repl(&ts, &["call test.APIService.Simple --repeat"], &[], &[])
+            .await
+            .unwrap();
         assert!(
             out.err.contains("no previous request exists for method"),
             "{out:?}"
@@ -1242,7 +1248,7 @@ mod repl {
         let ts = spawn().await;
         let out = run_repl_with_headers(
             &ts,
-            &["package test", "service APIService", "call Simple --enrich"],
+            &["call test.APIService.Simple --enrich"],
             &["ktr"],
             &[],
             &[("x-evans-echo", "hi")],
@@ -1257,12 +1263,7 @@ mod repl {
         let ts = spawn().await;
         let out = run_repl(
             &ts,
-            &[
-                "package test",
-                "service APIService",
-                "call Simple",
-                "call -r Simple",
-            ],
+            &["call test.APIService.Simple", "call -r Simple"],
             &["ktr"],
             &[],
         )

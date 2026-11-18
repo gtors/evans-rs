@@ -41,20 +41,18 @@ impl Cli {
 /// Merges the common flags of the root command and the ones of a subcommand.
 fn merge_common(root: &Common, sub: &Common) -> Common {
     Common {
-        package: sub.package.clone().or_else(|| root.package.clone()),
-        service: sub.service.clone().or_else(|| root.service.clone()),
         path: merged_vec(&root.path, &sub.path),
         proto: merged_vec(&root.proto, &sub.proto),
         host: sub.host.clone().or_else(|| root.host.clone()),
         port: sub.port.clone().or_else(|| root.port.clone()),
         header: merged_vec(&root.header, &sub.header),
-        reflection: sub.reflection.or(root.reflection),
-        tls: sub.tls.or(root.tls),
+        reflection: sub.reflection || root.reflection,
+        tls: sub.tls || root.tls,
         cacert: sub.cacert.clone().or_else(|| root.cacert.clone()),
         cert: sub.cert.clone().or_else(|| root.cert.clone()),
         certkey: sub.certkey.clone().or_else(|| root.certkey.clone()),
         servername: sub.servername.clone().or_else(|| root.servername.clone()),
-        silent: sub.silent.or(root.silent),
+        silent: sub.silent || root.silent,
     }
 }
 
@@ -125,12 +123,6 @@ pub enum CliCommand {
 
 #[derive(Args, Debug, Default, Clone)]
 pub struct Common {
-    /// default package
-    #[arg(long, value_name = "PACKAGE")]
-    pub package: Option<String>,
-    /// default service
-    #[arg(long, value_name = "SERVICE")]
-    pub service: Option<String>,
     /// comma-separated proto file paths
     #[arg(long, value_name = "PATH", value_delimiter = ',')]
     pub path: Vec<String>,
@@ -147,26 +139,11 @@ pub struct Common {
     #[arg(long, value_name = "KEY=VALUE")]
     pub header: Vec<String>,
     /// use gRPC server reflection
-    ///
-    /// The value must be attached with `=` (e.g. `--reflection=false`) so that the
-    /// following positional argument is not consumed as the flag value.
-    #[arg(
-        short = 'r',
-        long,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        require_equals = true
-    )]
-    pub reflection: Option<bool>,
+    #[arg(short = 'r', long)]
+    pub reflection: bool,
     /// use a secure TLS connection
-    #[arg(
-        short = 't',
-        long,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        require_equals = true
-    )]
-    pub tls: Option<bool>,
+    #[arg(short = 't', long)]
+    pub tls: bool,
     /// the CA certificate file for verifying the server
     #[arg(long, value_name = "FILE")]
     pub cacert: Option<PathBuf>,
@@ -180,14 +157,8 @@ pub struct Common {
     #[arg(long, value_name = "NAME")]
     pub servername: Option<String>,
     /// hide redundant output
-    #[arg(
-        short = 's',
-        long,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        require_equals = true
-    )]
-    pub silent: Option<bool>,
+    #[arg(short = 's', long)]
+    pub silent: bool,
 }
 
 #[cfg(test)]
@@ -202,20 +173,27 @@ mod tests {
     #[test]
     fn a_boolean_flag_does_not_consume_the_subcommand() {
         let cli = parse(&["-r", "cli", "list"]);
-        assert_eq!(cli.common().reflection, Some(true));
+        assert!(cli.common().reflection);
         assert!(matches!(cli.command, Some(Command::Cli { .. })));
     }
 
     #[test]
-    fn a_boolean_flag_accepts_an_explicit_value() {
-        let cli = parse(&["--reflection=false", "cli", "list"]);
-        assert_eq!(cli.common().reflection, Some(false));
+    fn a_boolean_flag_is_false_when_it_is_not_given() {
+        let cli = parse(&["cli", "list"]);
+        assert!(!cli.common().reflection);
+        assert!(!cli.common().tls);
+        assert!(!cli.common().silent);
+    }
+
+    #[test]
+    fn a_boolean_flag_does_not_accept_a_value() {
+        assert!(Cli::try_parse_from(["evans", "--reflection=false", "cli", "list"]).is_err());
     }
 
     #[test]
     fn a_boolean_flag_is_merged_with_the_one_of_the_subcommand() {
-        let cli = parse(&["--tls", "cli", "call", "--tls=false", "pkg.Svc.Method"]);
-        assert_eq!(cli.common().tls, Some(false));
+        let cli = parse(&["--tls", "cli", "call", "--tls", "pkg.Svc.Method"]);
+        assert!(cli.common().tls);
     }
 
     #[test]

@@ -44,6 +44,16 @@ pub trait Prompter {
 
     /// Asks the user to choose one of `options` and returns the index of the choice.
     fn select(&mut self, message: &str, options: &[String]) -> Result<usize, FillError>;
+
+    /// Asks the user to choose one of `options` and returns the index of the choice.
+    /// `Ok(None)` means that the user canceled the selection.
+    fn select_opt(
+        &mut self,
+        message: &str,
+        options: &[String],
+    ) -> Result<Option<usize>, FillError> {
+        self.select(message, options).map(Some)
+    }
 }
 
 /// Options that control how fields are filled.

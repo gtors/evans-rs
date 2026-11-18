@@ -23,7 +23,7 @@ pub async fn run(cfg: &Config, idl: &Idl, command: &CliCommand) -> Result<()> {
             output,
             ..
         } => {
-            let method = resolve_method(idl, cfg, method)?;
+            let method = resolve_method(idl, method)?;
             let body = read_body(file.as_deref())?;
             let mut client = Client::new(&cfg.server, &cfg.request).await?;
             let response = call(&mut client, &method, &body).await?;
@@ -52,24 +52,9 @@ pub async fn run(cfg: &Config, idl: &Idl, command: &CliCommand) -> Result<()> {
 }
 
 /// Resolves the method to call. The method name may be a fully-qualified method name
-/// (`pkg.Service.Method`) or a method name of the selected package and service.
-fn resolve_method(idl: &Idl, cfg: &Config, name: &str) -> Result<MethodDescriptor> {
-    if name.contains('.') {
-        let (fqsn, method) = idl
-            .resolve_fully_qualified_method_name(name)
-            .map_err(|_| anyhow!("failed to get the RPC descriptor for: {name}"))?;
-        return idl
-            .method(&fqsn, &method)
-            .map_err(|_| anyhow!("failed to get the RPC descriptor for: {name}"));
-    }
-
-    let fqsn = crate::idl::fully_qualified_service_name(&cfg.default.package, &cfg.default.service);
-    if fqsn.is_empty() {
-        return Err(anyhow!(
-            "package unselected. please specify the package and service, or use a fully-qualified method name"
-        ));
-    }
-    idl.method(&fqsn, name)
+/// (`pkg.Service.Method`) or the short name of a method.
+fn resolve_method(idl: &Idl, name: &str) -> Result<MethodDescriptor> {
+    idl.resolve_method(name)
         .map_err(|e| anyhow!("failed to get the RPC descriptor for: {name}: {e}"))
 }
 

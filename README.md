@@ -7,7 +7,7 @@ CLI mode that reads JSON from stdin and prints JSON to stdout.
 ## Features
 
 - **REPL mode** — a line-based prompt with completion, history and a small command set
-  (`call`, `service`, `package`, `show`, `desc`, `header`, `exit`).
+  (`call`, `show`, `desc`, `header`, `exit`).
 - **CLI mode** — one-shot calls for scripting, with `--enrich`, `--emit-defaults` and
   `curl`/`json` output formats.
 - **IDL sources** — local `.proto` files or gRPC server reflection.
@@ -40,17 +40,25 @@ $ evans --proto api/api.proto
 
  more expressive universal gRPC client
 
-api.Example@127.0.0.1:50051> package api
-api.Example@127.0.0.1:50051> service Example
-api.Example@127.0.0.1:50051> call Unary
+127.0.0.1:50051> call api.Example.Unary
 name (string) => ktr
 {
   "message": "hello, ktr"
 }
 ```
 
-Use the arrow keys to complete command names, flags and arguments. `ctrl+c` skips the rest
-of the fields of the current message and `ctrl+d` finishes the input.
+Use `tab` to complete command names, flags and arguments. The candidates are read from
+the loaded `.proto` files, so `call` completes the methods of the services and `desc`
+completes the messages. `shift+tab` cycles through the candidates backwards and
+`ctrl+space` opens the menu as well.
+
+`call` without a method name opens a list of the methods of the loaded services, so
+that the method can be picked instead of typed. `ctrl+c` skips the rest of the fields
+of the current message and `ctrl+d` finishes the input.
+
+The methods and the messages are addressed by their fully-qualified name, like
+`api.Example.Unary`. A short name, like `Unary`, is resolved among the loaded services
+and is ambiguous when several of them share it.
 
 ### CLI mode
 
@@ -76,8 +84,6 @@ written to stdout before the error, like the original does.
 
 | Flag | Description |
 |------|-------------|
-| `--package` | default package name |
-| `--service` | default service name |
 | `--path` | comma-separated proto file search paths |
 | `--proto` | comma-separated proto file names |
 | `--host` | gRPC server host |
@@ -90,9 +96,8 @@ written to stdout before the error, like the original does.
 | `--servername` | override the server name used to verify the hostname |
 | `--silent`, `-s` | hide redundant output |
 
-The boolean flags accept an explicit value only when it is attached with `=`
-(e.g. `--reflection=false`), so that the following argument is never mistaken for the
-value of the flag.
+The boolean flags are switches: they take no value, so `--reflection` turns the
+reflection on and the absence of the flag leaves it as the configuration says.
 
 ## Configuration
 
@@ -106,16 +111,14 @@ Evans reads its configuration from, in increasing order of priority:
 
 ```toml
 [default]
-package = ""
 protoPath = [""]
 protoFile = [""]
-service = ""
 
 [meta]
 configVersion = "0.1.0"
 
 [repl]
-promptFormat = "{package}.{service}@{addr}:{port}"
+promptFormat = "{addr}:{port}"
 inputPromptFormat = "{ancestor}{name} ({type}) => "
 coloredOutput = true
 silent = false

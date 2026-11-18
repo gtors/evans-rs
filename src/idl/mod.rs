@@ -10,12 +10,22 @@ pub const REFLECTION_SERVICE_V1ALPHA: &str = "grpc.reflection.v1alpha.ServerRefl
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("unknown service name")]
-    UnknownServiceName,
+    #[error("unknown service name '{0}'")]
+    UnknownServiceName(String),
     #[error("unknown RPC name")]
     UnknownRpcName,
     #[error("unknown symbol")]
     UnknownSymbol,
+    #[error("unknown method name '{0}'")]
+    UnknownMethodName(String),
+    #[error("unknown message name '{0}'")]
+    UnknownMessageName(String),
+    #[error("ambiguous {kind} '{name}'. the candidates are: {candidates}")]
+    AmbiguousName {
+        kind: &'static str,
+        name: String,
+        candidates: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -60,7 +70,7 @@ impl Idl {
         let mut pkgs: Vec<String> = self
             .list_services()
             .into_iter()
-            .map(|fqsn| parse_fully_qualified_service_name(&fqsn).0)
+            .map(|fqsn| split_fully_qualified_service_name(&fqsn).0.to_string())
             .collect();
         pkgs.sort();
         pkgs.dedup();
@@ -70,7 +80,7 @@ impl Idl {
     pub fn service(&self, fqsn: &str) -> Result<ServiceDescriptor> {
         self.pool
             .get_service_by_name(fqsn)
-            .ok_or(Error::UnknownServiceName)
+            .ok_or_else(|| Error::UnknownServiceName(fqsn.to_string()))
     }
 
     pub fn methods(&self, fqsn: &str) -> Result<Vec<MethodDescriptor>> {
@@ -84,29 +94,73 @@ impl Idl {
             .ok_or(Error::UnknownRpcName)
     }
 
-    pub fn resolve_message(&self, fqn: &str) -> Result<MessageDescriptor> {
-        self.pool
-            .get_message_by_name(fqn)
-            .ok_or(Error::UnknownSymbol)
+    /// Resolves a message by its fully-qualified name or by its short name.
+    ///
+    /// The short name is ambiguous when several messages share it.
+    pub fn resolve_message(&self, name: &str) -> Result<MessageDescriptor> {
+        if let Some(desc) = self.pool.get_message_by_name(name) {
+            return Ok(desc);
+        }
+
+        let candidates: Vec<MessageDescriptor> = self
+            .pool
+            .all_messages()
+            .filter(|message| message.name() == name)
+            .collect();
+
+        match candidates.as_slice() {
+            [desc] => Ok(desc.clone()),
+            [] => Err(Error::UnknownMessageName(name.to_string())),
+            many => Err(Error::AmbiguousName {
+                kind: "message name",
+                name: name.to_string(),
+                candidates: join_names(many.iter().map(|m| m.full_name())),
+            }),
+        }
     }
 
     pub fn resolve_fully_qualified_method_name(&self, fqmn: &str) -> Result<(String, String)> {
         self.methods.get(fqmn).cloned().ok_or(Error::UnknownSymbol)
     }
-}
 
-pub fn parse_fully_qualified_service_name(fqsn: &str) -> (String, String) {
-    match fqsn.rfind('.') {
-        None => (String::new(), fqsn.to_string()),
-        Some(i) => (fqsn[..i].to_string(), fqsn[i + 1..].to_string()),
+    /// Resolves a method by its fully-qualified name, like `pkg.Service.Method`, or by
+    /// its short name.
+    ///
+    /// The short name is ambiguous when several methods share it.
+    pub fn resolve_method(&self, name: &str) -> Result<MethodDescriptor> {
+        if let Some((fqsn, method)) = self.methods.get(name) {
+            return self.method(fqsn, method);
+        }
+
+        let candidates: Vec<MethodDescriptor> = self
+            .pool
+            .services()
+            .flat_map(|service| service.methods().collect::<Vec<_>>())
+            .filter(|method| method.name() == name)
+            .collect();
+
+        match candidates.as_slice() {
+            [desc] => Ok(desc.clone()),
+            [] => Err(Error::UnknownMethodName(name.to_string())),
+            many => Err(Error::AmbiguousName {
+                kind: "method name",
+                name: name.to_string(),
+                candidates: join_names(many.iter().map(|m| m.full_name())),
+            }),
+        }
     }
 }
 
-pub fn fully_qualified_service_name(pkg: &str, svc: &str) -> String {
-    if pkg.is_empty() {
-        svc.to_string()
-    } else {
-        format!("{pkg}.{svc}")
+/// Joins the names of the candidates of an ambiguous symbol.
+fn join_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    names.collect::<Vec<_>>().join(", ")
+}
+
+/// Splits a fully-qualified service name into its package and its service name.
+pub fn split_fully_qualified_service_name(fqsn: &str) -> (&str, &str) {
+    match fqsn.rfind('.') {
+        None => ("", fqsn),
+        Some(i) => (&fqsn[..i], &fqsn[i + 1..]),
     }
 }
 
@@ -196,15 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_fqsn() {
-        assert_eq!(
-            parse_fully_qualified_service_name("a.b.Service"),
-            ("a.b".to_string(), "Service".to_string())
-        );
-        assert_eq!(
-            parse_fully_qualified_service_name("Service"),
-            ("".to_string(), "Service".to_string())
-        );
+    fn resolves_a_method_by_its_fully_qualified_name() {
+        let idl = idl();
+        let method = idl.resolve_method("test.APIService.Unary").unwrap();
+        assert_eq!(method.name(), "Unary");
+        assert!(matches!(
+            idl.resolve_method("test.APIService.Nope"),
+            Err(Error::UnknownMethodName(_))
+        ));
     }
 
     #[test]
@@ -212,11 +265,95 @@ mod tests {
         let idl = idl();
         assert!(matches!(
             idl.service("test.Nope"),
-            Err(Error::UnknownServiceName)
+            Err(Error::UnknownServiceName(_))
         ));
         assert!(matches!(
             idl.method("test.APIService", "Nope"),
             Err(Error::UnknownRpcName)
         ));
+    }
+
+    #[test]
+    fn resolves_a_method_by_its_short_name() {
+        let idl = idl();
+        // The short name is resolved when it is unique.
+        assert_eq!(
+            idl.resolve_method("Simple").unwrap().full_name(),
+            "test.APIService.Simple"
+        );
+        assert!(matches!(
+            idl.resolve_method("Nope"),
+            Err(Error::UnknownMethodName(_))
+        ));
+    }
+
+    #[test]
+    fn resolves_a_message_by_its_short_name() {
+        let idl = idl();
+        assert_eq!(
+            idl.resolve_message("UnaryRequest").unwrap().full_name(),
+            "test.UnaryRequest"
+        );
+        assert!(matches!(
+            idl.resolve_message("Nope"),
+            Err(Error::UnknownMessageName(_))
+        ));
+    }
+
+    #[test]
+    fn reports_an_ambiguous_name() {
+        let fds = protox::compile(
+            [
+                "testdata/proto/test.proto",
+                "testdata/proto/ambiguous.proto",
+            ],
+            ["testdata/proto"],
+        )
+        .unwrap();
+        let pool = DescriptorPool::from_file_descriptor_set(fds).unwrap();
+        let idl = Idl::from_pool(pool);
+
+        match idl.resolve_method("Unary") {
+            Err(Error::AmbiguousName {
+                kind,
+                name,
+                candidates,
+            }) => {
+                assert_eq!(kind, "method name");
+                assert_eq!(name, "Unary");
+                assert!(candidates.contains("test.APIService.Unary"), "{candidates}");
+                assert!(
+                    candidates.contains("other.APIService.Unary"),
+                    "{candidates}"
+                );
+            }
+            other => panic!("expected an ambiguous method name, but got {other:?}"),
+        }
+
+        match idl.resolve_message("UnaryRequest") {
+            Err(Error::AmbiguousName {
+                kind,
+                name,
+                candidates,
+            }) => {
+                assert_eq!(kind, "message name");
+                assert_eq!(name, "UnaryRequest");
+                assert!(candidates.contains("test.UnaryRequest"), "{candidates}");
+                assert!(candidates.contains("other.UnaryRequest"), "{candidates}");
+            }
+            other => panic!("expected an ambiguous message name, but got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn splits_a_fully_qualified_service_name() {
+        assert_eq!(
+            split_fully_qualified_service_name("a.b.Service"),
+            ("a.b", "Service")
+        );
+        assert_eq!(
+            split_fully_qualified_service_name("Service"),
+            ("", "Service")
+        );
     }
 }
