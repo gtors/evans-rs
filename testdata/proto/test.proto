@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package test;
+
+service APIService {
+  rpc Unary(UnaryRequest) returns (UnaryResponse);
+  rpc ServerStream(UnaryRequest) returns (stream UnaryResponse);
+  rpc ClientStream(stream UnaryRequest) returns (UnaryResponse);
+  rpc BidirectionalStream(stream UnaryRequest) returns (stream UnaryResponse);
+  rpc Simple(SimpleRequest) returns (SimpleResponse);
+  rpc SimpleStream(SimpleRequest) returns (stream SimpleResponse);
+  rpc SimpleClientStream(stream SimpleRequest) returns (SimpleResponse);
+  rpc UnaryFailure(UnaryRequest) returns (UnaryResponse);
+}
+
+service EmptyService {
+  rpc Missing(UnaryRequest) returns (UnaryResponse);
+}
+
+enum Suit {
+  SUIT_UNSPECIFIED = 0;
+  CLUBS = 1;
+  DIAMONDS = 2;
+  HEARTS = 3;
+  SPADES = 4;
+}
+
+message UnaryRequest {
+  string name = 1;
+  repeated string tags = 2;
+  Suit suit = 3;
+  optional int32 age = 4;
+  oneof body {
+    string text = 5;
+    bytes payload = 6;
+  }
+  Nested nested = 7;
+}
+
+message Nested {
+  string id = 1;
+  repeated int32 numbers = 2;
+}
+
+message FillScalars {
+  string name = 1;
+  optional int32 age = 2;
+}
+
+message FillEnum {
+  Suit suit = 1;
+}
+
+message FillRepeated {
+  repeated string tags = 1;
+}
+
+message FillMap {
+  map<string, string> attrs = 1;
+}
+
+message FillRepeatedMessage {
+  repeated FillNested items = 1;
+}
+
+message FillBytes {
+  bytes payload = 1;
+}
+
+message FillNested {
+  string id = 1;
+}
+
+message FillNestedRequest {
+  FillNested nested = 1;
+}
+
+message FillOneof {
+  oneof body {
+    string text = 1;
+    bytes raw = 2;
+  }
+}
+
+message UnaryResponse {
+  string message = 1;
+  Suit suit = 2;
+  optional int32 age = 3;
+  repeated string tags = 4;
+  string text = 5;
+}
+
+message SimpleRequest {
+  string name = 1;
+}
+
+message SimpleResponse {
+  string message = 1;
+}

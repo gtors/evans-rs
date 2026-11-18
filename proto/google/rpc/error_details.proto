@@ -1,0 +1,138 @@
+// The error details of a gRPC call, as they are defined by the Google API.
+//
+// They are vendored to render the details of a failed call like the original does.
+syntax = "proto3";
+
+package google.rpc;
+
+import "google/protobuf/duration.proto";
+
+option cc_enable_arenas = true;
+option go_package = "google.golang.org/genproto/googleapis/rpc/errdetails;errdetails";
+option java_multiple_files = true;
+option java_outer_classname = "ErrorDetailsProto";
+option java_package = "com.google.rpc";
+option objc_class_prefix = "RPC";
+
+// Describes the cause of the error with structured details.
+message ErrorInfo {
+  // The reason of the error.
+  string reason = 1;
+
+  // The logical grouping to which the "reason" belongs.
+  string domain = 2;
+
+  // Additional structured details about this error.
+  map<string, string> metadata = 3;
+}
+
+// Describes when the clients can retry a failed request.
+message RetryInfo {
+  // Clients should wait at least this long between retrying the same request.
+  google.protobuf.Duration retry_delay = 1;
+}
+
+// Describes additional debugging info.
+message DebugInfo {
+  // The stack trace entries indicating where the error occurred.
+  repeated string stack_entries = 1;
+
+  // Additional debugging information.
+  string detail = 2;
+}
+
+// Describes how a quota check failed.
+message QuotaFailure {
+  // A message type used to describe a single quota violation.
+  message Violation {
+    // The subject on which the quota check failed.
+    string subject = 1;
+
+    // A description of how the quota check failed.
+    string description = 2;
+  }
+
+  // Describes all the quota violations.
+  repeated Violation violations = 1;
+}
+
+// Describes what preconditions have failed.
+message PreconditionFailure {
+  // A message type used to describe a single precondition failure.
+  message Violation {
+    // The type of PreconditionFailure.
+    string type = 1;
+
+    // The subject, relative to the type, that failed.
+    string subject = 2;
+
+    // A description of how the precondition failed.
+    string description = 3;
+  }
+
+  // Describes all the precondition violations.
+  repeated Violation violations = 1;
+}
+
+// Describes violations in a client request.
+message BadRequest {
+  // A message type used to describe a single bad request field.
+  message FieldViolation {
+    // A path that leads to a field in the request body.
+    string field = 1;
+
+    // A description of why the request element is bad.
+    string description = 2;
+  }
+
+  // Describes all the violations in a client request.
+  repeated FieldViolation field_violations = 1;
+}
+
+// Contains metadata about the request that clients can attach when filing a bug.
+message RequestInfo {
+  // An opaque string that should only be interpreted by the service generating it.
+  string request_id = 1;
+
+  // Any data that was used to serve this request.
+  string serving_data = 2;
+}
+
+// Describes the resource that is being accessed.
+message ResourceInfo {
+  // The type of the resource.
+  string resource_type = 1;
+
+  // The name of the resource.
+  string resource_name = 2;
+
+  // The owner of the resource.
+  string owner = 3;
+
+  // A description of the resource.
+  string description = 4;
+}
+
+// Provides links to documentation or for performing an out-of-band action.
+message Help {
+  // Describes a link.
+  message Link {
+    // A description of the link.
+    string description = 1;
+
+    // The URL of the link.
+    string url = 2;
+  }
+
+  // Describes what the client can do to resolve the error.
+  repeated Link links = 1;
+}
+
+// Provides a localized error message that is safe to return to the user.
+message LocalizedMessage {
+  // The locale of the following message.
+  string locale = 1;
+
+  // The localized error message in the above locale.
+  string message = 2;
+}
