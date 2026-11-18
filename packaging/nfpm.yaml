@@ -4,7 +4,7 @@
 # for every target:
 #
 #   VERSION  package version, taken from Cargo.toml
-#   ARCH     package architecture (amd64, arm64, x86_64, aarch64, ...)
+#   ARCH     package architecture (amd64, x86_64, ...)
 #
 # nfpm maps the architecture to the nomenclature of every packager, so `amd64`
 # becomes `amd64` in the deb, `x86_64` in the rpm and `x86_64` in the package

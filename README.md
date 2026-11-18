@@ -161,7 +161,6 @@ supported architecture:
 |--------|--------------|----------|
 | `x86_64-unknown-linux-gnu` | x86_64 | `evans-<version>-linux-x86_64.tar.gz`, `evans_<version>_amd64.deb`, `evans-<version>-1.x86_64.rpm`, `evans-<version>-1-x86_64.pkg.tar.zst` |
 | `x86_64-unknown-linux-musl` | x86_64 | `evans-<version>-linux-x86_64-musl.tar.gz` |
-| `aarch64-unknown-linux-gnu` | aarch64 | `evans_<version>_arm64.deb`, `evans-<version>-1.aarch64.rpm`, `evans-<version>-1-aarch64.pkg.tar.zst` |
 
 Every package contains the `evans` binary and its README, and it is published with a
 SHA-256 checksum. Pushing a `v*` tag publishes the packages as a GitHub release.

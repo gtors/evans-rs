@@ -53,10 +53,16 @@ jobs:
           TARGET: ${{ matrix.target }}
           LINKER: ${{ matrix.linker }}
         run: |
-          # The environment variables of the linker and of the C compiler are named
-          # after the target, e.g. CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER.
+          # cargo reads the linker from an upper case variable named after the
+          # target, e.g. CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER.
           suffix=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
           echo "CARGO_TARGET_${suffix}_LINKER=${LINKER}" >> "$GITHUB_ENV"
+
+          # The cc crate, which builds the C code of ring, reads the compiler
+          # from a lower case variable named after the target, e.g.
+          # CC_x86_64_unknown_linux_musl. Without it the C code is built by the
+          # compiler of the host and the link fails.
+          suffix=$(echo "$TARGET" | tr 'a-z-' 'a-z_')
           echo "CC_${suffix}=${LINKER}" >> "$GITHUB_ENV"
 
       - name: Build the binary
@@ -115,6 +121,9 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          # The job does not check out the repository, so gh has to be told which
+          # repository it has to work with.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           if gh release view "$TAG" > /dev/null 2>&1; then
