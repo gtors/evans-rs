@@ -60,6 +60,10 @@ The methods and the messages are addressed by their fully-qualified name, like
 `api.Example.Unary`. A short name, like `Unary`, is resolved among the loaded services
 and is ambiguous when several of them share it.
 
+The fields of the `bytes` type are asked for in two steps: first the format of the
+value is chosen, and then the value is typed. The `file` format reads the contents of
+a file, whose path is completed with `tab` like the other paths.
+
 ### CLI mode
 
 ```console

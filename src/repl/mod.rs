@@ -80,12 +80,6 @@ pub struct CallOptions {
     pub emit_defaults: bool,
     /// The prompt asks whether to dig down into a message field.
     pub dig_manually: bool,
-    /// The bytes input is interpreted as a base64-encoded string.
-    pub bytes_as_base64: bool,
-    /// The bytes input is interpreted as a quoted byte literal.
-    pub bytes_as_quoted_literals: bool,
-    /// The bytes input is interpreted as a path to a file.
-    pub bytes_from_file: bool,
     /// The prompt asks whether to add a value to a repeated field.
     pub add_repeated_manually: bool,
     /// The previous request of the method is repeated.
@@ -260,9 +254,6 @@ impl<'a> Repl<'a> {
                 enrich,
                 emit_defaults,
                 dig_manually,
-                bytes_as_base64,
-                bytes_as_quoted_literals,
-                bytes_from_file,
                 add_repeated_manually,
                 repeat,
             } => {
@@ -270,9 +261,6 @@ impl<'a> Repl<'a> {
                     enrich,
                     emit_defaults,
                     dig_manually,
-                    bytes_as_base64,
-                    bytes_as_quoted_literals,
-                    bytes_from_file,
                     add_repeated_manually,
                     repeat,
                 };
@@ -449,9 +437,6 @@ impl<'a> Repl<'a> {
 
         let fill_options = crate::message::filler::FillOptions {
             dig_manually: options.dig_manually,
-            bytes_as_base64: options.bytes_as_base64,
-            bytes_as_quoted_literals: options.bytes_as_quoted_literals,
-            bytes_from_file: options.bytes_from_file,
             add_repeated_manually: options.add_repeated_manually,
         };
 

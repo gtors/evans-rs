@@ -6,7 +6,6 @@
 //! oneof fields let the user pick the member to set.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -42,6 +41,14 @@ pub trait Prompter {
     /// rest of the fields and `Err(FillError::Eof)` means the input is over.
     fn input(&mut self, prefix: &str) -> Result<String, FillError>;
 
+    /// Reads the path of a file.
+    ///
+    /// The implementation may complete the paths of the files while they are typed.
+    /// The default implementation reads the path like any other input.
+    fn input_path(&mut self, prefix: &str) -> Result<String, FillError> {
+        self.input(prefix)
+    }
+
     /// Asks the user to choose one of `options` and returns the index of the choice.
     fn select(&mut self, message: &str, options: &[String]) -> Result<usize, FillError>;
 
@@ -61,12 +68,6 @@ pub trait Prompter {
 pub struct FillOptions {
     /// Ask whether to dig down into message fields instead of doing it automatically.
     pub dig_manually: bool,
-    /// Interpret bytes input as a base64-encoded string.
-    pub bytes_as_base64: bool,
-    /// Interpret bytes input as a string of (quoted) byte literal or Unicode.
-    pub bytes_as_quoted_literals: bool,
-    /// Interpret bytes input as a path to a file and read its contents.
-    pub bytes_from_file: bool,
     /// Ask whether to add another value when a repeated field is encountered.
     pub add_repeated_manually: bool,
 }
@@ -317,13 +318,49 @@ impl<'a, P: Prompter + ?Sized> Filler<'a, P> {
                     .unwrap_or_default();
                 Ok(Value::EnumNumber(number))
             }
+            Kind::Bytes => Ok(Value::Bytes(self.resolve_bytes(&prefix)?)),
             _ => {
                 let input = self.prompter.input(&prefix)?;
                 if input.is_empty() {
                     return Ok(default_value(field));
                 }
-                convert(&field.kind(), &input, self.options)
+                convert(&field.kind(), &input)
             }
+        }
+    }
+
+    /// Asks the user how the bytes are provided and reads them.
+    ///
+    /// The bytes are either a base64-encoded string or the contents of a file, whose
+    /// path is completed while it is typed.
+    fn resolve_bytes(&mut self, prefix: &str) -> Result<prost_reflect::bytes::Bytes, FillError> {
+        let options = vec!["base64".to_string(), "file".to_string()];
+        // Like the original, an aborted selection falls back to the default value.
+        let idx = match self.prompter.select(prefix, &options) {
+            Ok(idx) => idx,
+            Err(FillError::Abort) => 0,
+            Err(e) => return Err(e),
+        };
+
+        match idx {
+            0 => {
+                let input = self.prompter.input(prefix)?;
+                if input.is_empty() {
+                    return Ok(prost_reflect::bytes::Bytes::new());
+                }
+                decode_base64(&input)
+                    .map(prost_reflect::bytes::Bytes::from)
+                    .map_err(FillError::Invalid)
+            }
+            1 => {
+                let path = self.prompter.input_path(prefix)?;
+                let contents =
+                    std::fs::read(&path).map_err(|e| FillError::Io(format!("{path}: {e}")))?;
+                Ok(prost_reflect::bytes::Bytes::from(contents))
+            }
+            _ => Err(FillError::Invalid(format!(
+                "invalid selection: {idx} is out of range for the bytes"
+            ))),
         }
     }
 
@@ -403,7 +440,7 @@ fn kind_name(kind: &Kind) -> &'static str {
     }
 }
 
-fn convert(kind: &Kind, input: &str, options: FillOptions) -> Result<Value, FillError> {
+fn convert(kind: &Kind, input: &str) -> Result<Value, FillError> {
     let invalid = |input: &str| FillError::Invalid(input.to_string());
 
     Ok(match kind {
@@ -423,8 +460,7 @@ fn convert(kind: &Kind, input: &str, options: FillOptions) -> Result<Value, Fill
         }
         Kind::Bool => Value::Bool(parse_bool(input).ok_or_else(|| invalid(input))?),
         Kind::String => Value::String(input.to_string()),
-        Kind::Bytes => Value::Bytes(convert_bytes(input, options)?),
-        Kind::Message(_) | Kind::Enum(_) => {
+        Kind::Message(_) | Kind::Enum(_) | Kind::Bytes => {
             return Err(FillError::Invalid(format!(
                 "the type {kind:?} cannot be converted from a string"
             )));
@@ -440,130 +476,12 @@ fn parse_bool(input: &str) -> Option<bool> {
     }
 }
 
-fn convert_bytes(
-    input: &str,
-    options: FillOptions,
-) -> Result<prost_reflect::bytes::Bytes, FillError> {
-    if options.bytes_from_file {
-        let contents =
-            std::fs::read(Path::new(input)).map_err(|e| FillError::Io(format!("{input}: {e}")))?;
-        return Ok(prost_reflect::bytes::Bytes::from(contents));
-    }
-
-    if options.bytes_as_base64 {
-        return decode_base64(input)
-            .map(prost_reflect::bytes::Bytes::from)
-            .map_err(FillError::Invalid);
-    }
-
-    if options.bytes_as_quoted_literals {
-        return decode_quoted_literals(input)
-            .map(prost_reflect::bytes::Bytes::from)
-            .map_err(FillError::Invalid);
-    }
-
-    match decode_base64(input) {
-        Ok(decoded) => Ok(prost_reflect::bytes::Bytes::from(decoded)),
-        Err(base64_err) => match decode_quoted_literals(input) {
-            Ok(decoded) => Ok(prost_reflect::bytes::Bytes::from(decoded)),
-            Err(_) => Err(FillError::Invalid(base64_err)),
-        },
-    }
-}
-
 /// Decodes a standard base64 string. The padding is required and the trailing bits must
 /// be zero, like `base64.StdEncoding` of the original does.
 fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     BASE64
         .decode(input)
         .map_err(|e| format!("invalid base64 input: {input}: {e}"))
-}
-
-/// Interprets the input as a Go quoted string literal, like `strconv.Unquote` does.
-///
-/// The supported escape sequences are `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\\`,
-/// `\'`, `\"`, `\xHH`, `\uHHHH`, `\UHHHHHHHH` and the octal escapes `\OOO`.
-fn decode_quoted_literals(input: &str) -> Result<Vec<u8>, String> {
-    let invalid = || format!("invalid quoted literal: {input}");
-
-    let mut out = Vec::new();
-    let mut chars = input.chars();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                let esc = chars.next().ok_or_else(invalid)?;
-                match esc {
-                    'a' => out.push(0x07),
-                    'b' => out.push(0x08),
-                    'f' => out.push(0x0c),
-                    'n' => out.push(0x0a),
-                    'r' => out.push(0x0d),
-                    't' => out.push(0x09),
-                    'v' => out.push(0x0b),
-                    '\\' => out.push(b'\\'),
-                    '\'' => out.push(b'\''),
-                    '"' => out.push(b'"'),
-                    'x' => out.push(read_hex(&mut chars, 2, &invalid)? as u8),
-                    'u' => {
-                        let code = read_hex(&mut chars, 4, &invalid)?;
-                        push_char(&mut out, code).ok_or_else(invalid)?;
-                    }
-                    'U' => {
-                        let code = read_hex(&mut chars, 8, &invalid)?;
-                        push_char(&mut out, code).ok_or_else(invalid)?;
-                    }
-                    '0'..='7' => {
-                        let mut code = esc.to_digit(8).unwrap_or_default();
-                        for _ in 0..2 {
-                            let Some(digit) = chars.clone().next().and_then(|d| d.to_digit(8))
-                            else {
-                                break;
-                            };
-                            chars.next();
-                            code = code * 8 + digit;
-                        }
-                        out.push(code as u8);
-                    }
-                    _ => return Err(invalid()),
-                }
-            }
-            // A raw newline is not allowed in a quoted string.
-            '\n' | '\r' => return Err(invalid()),
-            c => {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-/// Reads exactly `digits` hexadecimal digits.
-fn read_hex(
-    chars: &mut std::str::Chars<'_>,
-    digits: usize,
-    invalid: &dyn Fn() -> String,
-) -> Result<u32, String> {
-    let mut code = 0u32;
-    for _ in 0..digits {
-        let digit = chars
-            .next()
-            .and_then(|c| c.to_digit(16))
-            .ok_or_else(invalid)?;
-        code = code * 16 + digit;
-    }
-    Ok(code)
-}
-
-/// Appends the UTF-8 encoding of a code point. Surrogates and out-of-range code points
-/// are rejected.
-fn push_char(out: &mut Vec<u8>, code: u32) -> Option<()> {
-    let c = char::from_u32(code)?;
-    let mut buf = [0u8; 4];
-    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-    Some(())
 }
 
 #[cfg(test)]
@@ -730,25 +648,47 @@ mod tests {
 
     #[test]
     fn decodes_bytes_from_base64() {
-        let msg = fill("test.FillBytes", &["SGVsbG8="], &[], FillOptions::default()).unwrap();
+        // The first selection chooses the format of the bytes.
+        let msg = fill(
+            "test.FillBytes",
+            &["SGVsbG8="],
+            &[0],
+            FillOptions::default(),
+        )
+        .unwrap();
         let data = msg.get_field_by_name("payload").unwrap();
         assert_eq!(data.as_bytes().unwrap().as_ref(), b"Hello");
     }
 
     #[test]
-    fn decodes_bytes_from_quoted_literals() {
+    fn reads_bytes_from_a_file() {
+        let path = std::env::temp_dir().join(format!("evans-bytes-{}.bin", std::process::id()));
+        std::fs::write(&path, b"\x00\x01\x02binary").unwrap();
+
+        // The second selection chooses the file.
         let msg = fill(
             "test.FillBytes",
-            &[r"\u3084\u306f\u308a"],
-            &[],
-            FillOptions {
-                bytes_as_quoted_literals: true,
-                ..Default::default()
-            },
+            &[path.to_str().unwrap()],
+            &[1],
+            FillOptions::default(),
         )
         .unwrap();
         let data = msg.get_field_by_name("payload").unwrap();
-        assert_eq!(data.as_bytes().unwrap().as_ref(), "やはり".as_bytes());
+        assert_eq!(data.as_bytes().unwrap().as_ref(), b"\x00\x01\x02binary");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reports_a_missing_file_of_the_bytes() {
+        let err = fill(
+            "test.FillBytes",
+            &["/nonexistent/file.bin"],
+            &[1],
+            FillOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("/nonexistent/file.bin"), "{err}");
     }
 
     #[test]
@@ -818,41 +758,8 @@ mod tests {
     }
 
     #[test]
-    fn decodes_bytes_as_base64_only_when_requested() {
-        let msg = fill(
-            "test.FillBytes",
-            &["SGVsbG8="],
-            &[],
-            FillOptions {
-                bytes_as_base64: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let data = msg.get_field_by_name("payload").unwrap();
-        assert_eq!(data.as_bytes().unwrap().as_ref(), b"Hello");
-    }
-
-    #[test]
-    fn falls_back_to_quoted_literals_when_the_input_is_not_base64() {
-        // "hello" is not a valid base64 string: it is interpreted as a quoted literal.
-        let msg = fill("test.FillBytes", &["hello"], &[], FillOptions::default()).unwrap();
-        let data = msg.get_field_by_name("payload").unwrap();
-        assert_eq!(data.as_bytes().unwrap().as_ref(), b"hello");
-    }
-
-    #[test]
     fn rejects_invalid_base64_input() {
-        let err = fill(
-            "test.FillBytes",
-            &["SGVsbG8"],
-            &[],
-            FillOptions {
-                bytes_as_base64: true,
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
+        let err = fill("test.FillBytes", &["SGVsbG8"], &[0], FillOptions::default()).unwrap_err();
         assert!(matches!(err, FillError::Invalid(_)), "{err:?}");
     }
 
@@ -864,38 +771,6 @@ mod tests {
         assert!(decode_base64("hello").is_err());
         assert!(decode_base64("SGVsbG8=!!!").is_err());
         assert!(decode_base64("").unwrap().is_empty());
-    }
-
-    #[test]
-    fn decodes_quoted_literals_like_the_original() {
-        // The expectations are taken from `strconv.Unquote` of the original.
-        let cases: &[(&str, &[u8])] = &[
-            ("hello", b"hello"),
-            (r"\n", b"\n"),
-            (r"\t", b"\t"),
-            (r"\\", b"\\"),
-            ("\\\"", b"\""),
-            (r"\x41", b"A"),
-            (r"\u3084\u306f\u308a", "やはり".as_bytes()),
-            (r"\U0001F600", "\u{1F600}".as_bytes()),
-            (r"\101", b"A"),
-            (r"\377", b"\xff"),
-            ("", b""),
-            ("ab", b"ab"),
-            (r"SGVsbG8=!!!", b"SGVsbG8=!!!"),
-            ("é", "é".as_bytes()),
-        ];
-        for (input, expected) in cases {
-            let decoded = decode_quoted_literals(input).unwrap();
-            assert_eq!(&decoded, expected, "input: {input:?}");
-        }
-
-        for input in [r"\8", r"\q", r"\xzz", r"\u12"] {
-            assert!(
-                decode_quoted_literals(input).is_err(),
-                "input: {input:?} should be rejected"
-            );
-        }
     }
 
     /// A prompter that aborts every input.

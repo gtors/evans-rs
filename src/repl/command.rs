@@ -18,21 +18,6 @@ pub const COMMANDS: &[Command] = &[
                 usage: "prompt asks whether to dig down if it encountered to a message field",
             },
             Flag {
-                name: "bytes-as-base64",
-                short: None,
-                usage: "explicitly interpret TYPE_BYTES input as base64-encoded string",
-            },
-            Flag {
-                name: "bytes-as-quoted-literals",
-                short: None,
-                usage: "interpret TYPE_BYTES input as a string of (quoted) byte literal or Unicode",
-            },
-            Flag {
-                name: "bytes-from-file",
-                short: None,
-                usage: "interpret TYPE_BYTES input as a relative path to a file",
-            },
-            Flag {
                 name: "emit-defaults",
                 short: None,
                 usage: "render fields with default values",
@@ -116,9 +101,6 @@ pub enum Parsed {
         enrich: bool,
         emit_defaults: bool,
         dig_manually: bool,
-        bytes_as_base64: bool,
-        bytes_as_quoted_literals: bool,
-        bytes_from_file: bool,
         add_repeated_manually: bool,
         repeat: bool,
     },
@@ -195,9 +177,6 @@ fn parse_call(args: &[String]) -> anyhow::Result<Parsed> {
     let mut enrich = false;
     let mut emit_defaults = false;
     let mut dig_manually = false;
-    let mut bytes_as_base64 = false;
-    let mut bytes_as_quoted_literals = false;
-    let mut bytes_from_file = false;
     let mut add_repeated_manually = false;
     let mut repeat = false;
     let mut method: Option<String> = None;
@@ -214,9 +193,6 @@ fn parse_call(args: &[String]) -> anyhow::Result<Parsed> {
                 "enrich" => enrich = enabled,
                 "emit-defaults" => emit_defaults = enabled,
                 "dig-manually" => dig_manually = enabled,
-                "bytes-as-base64" => bytes_as_base64 = enabled,
-                "bytes-as-quoted-literals" => bytes_as_quoted_literals = enabled,
-                "bytes-from-file" => bytes_from_file = enabled,
                 "add-repeated-manually" => add_repeated_manually = enabled,
                 "repeat" => repeat = enabled,
                 _ => anyhow::bail!("unknown flag: --{name}"),
@@ -229,23 +205,11 @@ fn parse_call(args: &[String]) -> anyhow::Result<Parsed> {
         method = Some(arg);
     }
 
-    if bytes_from_file && (bytes_as_base64 || bytes_as_quoted_literals) {
-        anyhow::bail!("only one of --bytes-from-file or --bytes-as-* can be specified");
-    }
-    if bytes_as_base64 && bytes_as_quoted_literals {
-        anyhow::bail!(
-            "only one of --bytes-as-base64 or --bytes-as-quoted-literals can be specified"
-        );
-    }
-
     Ok(Parsed::Call {
         method,
         enrich,
         emit_defaults,
         dig_manually,
-        bytes_as_base64,
-        bytes_as_quoted_literals,
-        bytes_from_file,
         add_repeated_manually,
         repeat,
     })
@@ -413,18 +377,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_bytes_flags() {
+    fn rejects_the_removed_bytes_flags() {
         let cmd = lookup("call").unwrap();
-        let err = parse(
-            cmd,
-            &[
-                "Unary".to_string(),
-                "--bytes-from-file".to_string(),
-                "--bytes-as-base64".to_string(),
-            ],
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("only one of"));
+        for flag in [
+            "--bytes-from-file",
+            "--bytes-as-base64",
+            "--bytes-as-quoted-literals",
+        ] {
+            let err = parse(cmd, &["Unary".to_string(), flag.to_string()]).unwrap_err();
+            assert!(err.to_string().contains("unknown flag"), "{err}");
+        }
     }
 
     #[test]
