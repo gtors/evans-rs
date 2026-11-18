@@ -54,9 +54,21 @@ pub struct ReplConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: String,
+    /// The path of the unix domain socket of the server.
+    ///
+    /// It takes precedence over the host and the port.
+    pub unix_socket: String,
     pub reflection: bool,
     pub tls: bool,
     pub name: String,
+    /// The certificate of the server is not verified.
+    pub insecure: bool,
+    /// The address of the proxy that the connection goes through.
+    ///
+    /// The scheme of the address selects the protocol of the proxy: `http` for a
+    /// proxy that tunnels with the HTTP CONNECT method, `socks5` and `socks4` for the
+    /// SOCKS proxies.
+    pub proxy: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,9 +112,12 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: "50051".to_string(),
+            unix_socket: String::new(),
             reflection: false,
             tls: false,
             name: String::new(),
+            insecure: false,
+            proxy: String::new(),
         }
     }
 }
@@ -188,7 +203,10 @@ pub(crate) fn from_files(global: Option<&Path>, local: Option<&Path>, cli: &Cli)
     // merged with the config instead of overriding it.
     cfg.server.reflection |= common.reflection;
     cfg.server.tls |= common.tls;
+    cfg.server.insecure |= common.insecure;
     cfg.repl.silent |= common.silent;
+    // The insecure connection is a TLS connection whose certificate is not verified.
+    cfg.server.tls |= cfg.server.insecure;
     cfg.validate()?;
     Ok(cfg)
 }
@@ -200,6 +218,12 @@ fn flag_overrides(common: &Common) -> Vec<(&'static str, Value)> {
     }
     if let Some(v) = &common.port {
         out.push(("server.port", Value::from(v.as_str())));
+    }
+    if let Some(v) = &common.unix_socket {
+        out.push(("server.unixSocket", Value::from(v.as_str())));
+    }
+    if let Some(v) = &common.proxy {
+        out.push(("server.proxy", Value::from(v.as_str())));
     }
     if let Some(v) = &common.servername {
         out.push(("server.name", Value::from(v.as_str())));

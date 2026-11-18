@@ -20,6 +20,226 @@ pub async fn spawn() -> TestServer {
     spawn_with_tls(false).await
 }
 
+/// The path of the unix domain socket of the test server.
+///
+/// The name keeps the sockets of the tests that run at the same time apart.
+pub fn unix_socket_path(name: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("evans-test-{}-{name}.sock", std::process::id()));
+    path
+}
+
+/// Spawns a test server that listens on a unix domain socket.
+pub async fn spawn_with_unix_socket(name: &str) -> TestServer {
+    let path = unix_socket_path(name);
+    let _ = std::fs::remove_file(&path);
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+    let fds = protox::compile(["testdata/proto/test.proto"], ["testdata/proto"]).unwrap();
+    let reflection_v1 = ReflectionBuilder::configure()
+        .register_file_descriptor_set(fds.clone())
+        .build_v1()
+        .unwrap();
+    let reflection_v1alpha = ReflectionBuilder::configure()
+        .register_file_descriptor_set(fds)
+        .build_v1alpha()
+        .unwrap();
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(proto::api_service_server::ApiServiceServer::new(
+                server::TestApiService,
+            ))
+            .add_service(reflection_v1)
+            .add_service(reflection_v1alpha)
+            .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    // The socket is ready when it accepts a connection.
+    for _ in 0..100 {
+        if tokio::net::UnixStream::connect(&path).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    TestServer {
+        addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        shutdown: None,
+        handle,
+    }
+}
+
+/// The kind of the proxy of the tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyKind {
+    Http,
+    Socks5,
+    Socks4,
+}
+
+impl ProxyKind {
+    /// The scheme of the address of the proxy.
+    fn scheme(&self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Socks5 => "socks5",
+            Self::Socks4 => "socks4",
+        }
+    }
+}
+
+/// Spawns a proxy that tunnels the connections to the server.
+///
+/// The proxy is a minimal implementation of the protocols, so that the client is
+/// tested against a real one.
+pub async fn spawn_proxy(kind: ProxyKind) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let target = match kind {
+                    ProxyKind::Http => http_connect(&mut stream).await,
+                    ProxyKind::Socks5 => socks5(&mut stream).await,
+                    ProxyKind::Socks4 => socks4(&mut stream).await,
+                };
+                let Ok(mut target) = target else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
+            });
+        }
+    });
+
+    addr
+}
+
+/// The handshake of the SOCKS5 proxy.
+async fn socks5(stream: &mut tokio::net::TcpStream) -> std::io::Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await?;
+    let mut methods = vec![0u8; greeting[1] as usize];
+    stream.read_exact(&mut methods).await?;
+    // The version and the "no authentication" method.
+    stream.write_all(&[0x05, 0x00]).await?;
+    stream.flush().await?;
+
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await?;
+    let host = match head[3] {
+        1 => {
+            let mut addr = [0u8; 4];
+            stream.read_exact(&mut addr).await?;
+            std::net::Ipv4Addr::from(addr).to_string()
+        }
+        3 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut addr = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut addr).await?;
+            String::from_utf8_lossy(&addr).to_string()
+        }
+        4 => {
+            let mut addr = [0u8; 16];
+            stream.read_exact(&mut addr).await?;
+            std::net::Ipv6Addr::from(addr).to_string()
+        }
+        _ => return Err(std::io::Error::other("unsupported address type")),
+    };
+    let mut port = [0u8; 2];
+    stream.read_exact(&mut port).await?;
+
+    let target = tokio::net::TcpStream::connect((host.as_str(), u16::from_be_bytes(port))).await?;
+    // The version, the "succeeded" status, the reserved bytes and the address.
+    stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+    stream.flush().await?;
+
+    Ok(target)
+}
+
+/// The handshake of the SOCKS4 proxy.
+async fn socks4(stream: &mut tokio::net::TcpStream) -> std::io::Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut head = [0u8; 8];
+    stream.read_exact(&mut head).await?;
+    let port = u16::from_be_bytes([head[2], head[3]]);
+
+    // The address of the target. The addresses that start with 0.0.0.x are the ones
+    // that carry a hostname, which is the extension of SOCKS4a.
+    let hostname = head[4] == 0 && head[5] == 0 && head[6] == 0 && head[7] != 0;
+    let host = if hostname {
+        let mut name = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await?;
+            if byte[0] == 0 {
+                break;
+            }
+            name.push(byte[0]);
+        }
+        String::from_utf8_lossy(&name).to_string()
+    } else {
+        format!("{}.{}.{}.{}", head[4], head[5], head[6], head[7])
+    };
+
+    // The user id, which is terminated by a null byte.
+    loop {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).await?;
+        if byte[0] == 0 {
+            break;
+        }
+    }
+
+    let target = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    // The version, the "granted" status and the address.
+    stream.write_all(&[0x00, 0x5a, 0, 0, 0, 0, 0, 0]).await?;
+    stream.flush().await?;
+
+    Ok(target)
+}
+
+/// The handshake of the proxy that tunnels with the HTTP CONNECT method.
+async fn http_connect(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut request = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).await?;
+        request.push(byte[0]);
+        if request.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let request = String::from_utf8_lossy(&request);
+    let target = request
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| std::io::Error::other("malformed request"))?
+        .to_string();
+
+    let target = tokio::net::TcpStream::connect(target).await?;
+    stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+    stream.flush().await?;
+
+    Ok(target)
+}
+
 pub async fn spawn_with_tls(tls: bool) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -99,10 +319,10 @@ impl Drop for TestServer {
 #[tokio::test]
 async fn reflection_lists_services_and_loads_descriptors() {
     let ts = spawn().await;
-    let pool = evans2::idl::reflection::load(ts.channel().await, &Default::default())
+    let pool = evans::idl::reflection::load(ts.channel().await, &Default::default())
         .await
         .unwrap();
-    let idl = evans2::idl::Idl::from_pool(pool);
+    let idl = evans::idl::Idl::from_pool(pool);
     assert_eq!(idl.list_packages(), vec!["test"]);
     assert_eq!(
         idl.list_services(),
@@ -115,6 +335,29 @@ async fn reflection_lists_services_and_loads_descriptors() {
         .method("test.APIService", "BidirectionalStream")
         .unwrap();
     assert!(bidi.is_client_streaming() && bidi.is_server_streaming());
+}
+
+#[tokio::test]
+async fn reflection_through_a_proxy() {
+    let ts = spawn().await;
+    let proxy = spawn_proxy(ProxyKind::Socks5).await;
+
+    let server = evans::config::ServerConfig {
+        host: ts.addr.ip().to_string(),
+        port: ts.addr.port().to_string(),
+        proxy: format!("socks5://127.0.0.1:{}", proxy.port()),
+        ..Default::default()
+    };
+    let request = evans::config::RequestConfig::default();
+
+    // The reflection uses the eager connection, which is another path than the lazy
+    // one of the calls.
+    let channel = evans::grpc::connect(&server, &request).await.unwrap();
+    let pool = evans::idl::reflection::load(channel, &Default::default())
+        .await
+        .unwrap();
+    let idl = evans::idl::Idl::from_pool(pool);
+    assert_eq!(idl.list_packages(), vec!["test"]);
 }
 
 #[tokio::test]
@@ -163,21 +406,21 @@ mod invoke {
         prost_reflect::DescriptorPool::from_file_descriptor_set(fds).unwrap()
     }
 
-    async fn client(addr: std::net::SocketAddr, echo: &str) -> evans2::grpc::Client {
-        let server = evans2::config::ServerConfig {
+    async fn client(addr: std::net::SocketAddr, echo: &str) -> evans::grpc::Client {
+        let server = evans::config::ServerConfig {
             host: addr.ip().to_string(),
             port: addr.port().to_string(),
             ..Default::default()
         };
-        let mut request = evans2::config::RequestConfig::default();
+        let mut request = evans::config::RequestConfig::default();
         request
             .header
             .insert("x-evans-echo".to_string(), vec![echo.to_string()]);
-        evans2::grpc::Client::new(&server, &request).await.unwrap()
+        evans::grpc::Client::new(&server, &request).await.unwrap()
     }
 
     fn request_message(
-        idl: &evans2::idl::Idl,
+        idl: &evans::idl::Idl,
         service: &str,
         method: &str,
         name: &str,
@@ -199,7 +442,7 @@ mod invoke {
     #[tokio::test]
     async fn unary_roundtrip_with_headers_and_trailers() {
         let ts = spawn().await;
-        let idl = evans2::idl::Idl::from_pool(pool());
+        let idl = evans::idl::Idl::from_pool(pool());
         let method = idl.method("test.APIService", "Unary").unwrap();
         let mut msg = request_message(&idl, "test.APIService", "Unary", "world");
         msg.set_field_by_name("age", Value::I32(3));
@@ -239,7 +482,7 @@ mod invoke {
     #[tokio::test]
     async fn server_streaming_yields_all_messages() {
         let ts = spawn().await;
-        let idl = evans2::idl::Idl::from_pool(pool());
+        let idl = evans::idl::Idl::from_pool(pool());
         let method = idl.method("test.APIService", "ServerStream").unwrap();
         let msg = request_message(&idl, "test.APIService", "ServerStream", "stream");
 
@@ -258,7 +501,7 @@ mod invoke {
     #[tokio::test]
     async fn client_streaming_joins_messages() {
         let ts = spawn().await;
-        let idl = evans2::idl::Idl::from_pool(pool());
+        let idl = evans::idl::Idl::from_pool(pool());
         let method = idl.method("test.APIService", "ClientStream").unwrap();
 
         let names = ["a", "b", "c"];
@@ -283,7 +526,7 @@ mod invoke {
     #[tokio::test]
     async fn bidirectional_streaming_echoes_each_message() {
         let ts = spawn().await;
-        let idl = evans2::idl::Idl::from_pool(pool());
+        let idl = evans::idl::Idl::from_pool(pool());
         let method = idl
             .method("test.APIService", "BidirectionalStream")
             .unwrap();
@@ -310,7 +553,7 @@ mod invoke {
     #[tokio::test]
     async fn unimplemented_rpc_reports_status() {
         let ts = spawn().await;
-        let idl = evans2::idl::Idl::from_pool(pool());
+        let idl = evans::idl::Idl::from_pool(pool());
         let method = idl.method("test.EmptyService", "Missing").unwrap();
         let msg = request_message(&idl, "test.EmptyService", "Missing", "world");
 
@@ -324,16 +567,16 @@ mod invoke {
     #[tokio::test]
     async fn invalid_request_header_is_rejected() {
         let ts = spawn().await;
-        let server = evans2::config::ServerConfig {
+        let server = evans::config::ServerConfig {
             host: ts.addr.ip().to_string(),
             port: ts.addr.port().to_string(),
             ..Default::default()
         };
-        let mut request = evans2::config::RequestConfig::default();
+        let mut request = evans::config::RequestConfig::default();
         request
             .header
             .insert("invalid header".to_string(), vec!["v".to_string()]);
-        let err = evans2::grpc::Client::new(&server, &request)
+        let err = evans::grpc::Client::new(&server, &request)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("invalid header name"));
@@ -342,22 +585,150 @@ mod invoke {
     #[tokio::test]
     async fn tls_unary_roundtrip() {
         let ts = spawn_with_tls(true).await;
-        let idl = evans2::idl::Idl::from_pool(pool());
+        let idl = evans::idl::Idl::from_pool(pool());
         let method = idl.method("test.APIService", "Unary").unwrap();
         let msg = request_message(&idl, "test.APIService", "Unary", "secure");
 
-        let server = evans2::config::ServerConfig {
+        let server = evans::config::ServerConfig {
             host: ts.addr.ip().to_string(),
             port: ts.addr.port().to_string(),
             tls: true,
             ..Default::default()
         };
-        let request = evans2::config::RequestConfig {
+        let request = evans::config::RequestConfig {
             ca_cert_file: "testdata/tls/ca.crt".to_string(),
             ..Default::default()
         };
 
-        let mut client = evans2::grpc::Client::new(&server, &request).await.unwrap();
+        let mut client = evans::grpc::Client::new(&server, &request).await.unwrap();
+        let result = client.invoke(&method, msg).await.unwrap();
+        assert_eq!(
+            field_str(result.message.as_ref().unwrap(), "message"),
+            "secure"
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_a_unary_rpc_over_a_unix_socket() {
+        let _ts = spawn_with_unix_socket("uds").await;
+        let idl = evans::idl::Idl::from_pool(pool());
+        let method = idl.method("test.APIService", "Unary").unwrap();
+        let msg = request_message(&idl, "test.APIService", "Unary", "uds");
+
+        let server = evans::config::ServerConfig {
+            unix_socket: unix_socket_path("uds").to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        let mut client =
+            evans::grpc::Client::new(&server, &evans::config::RequestConfig::default())
+                .await
+                .unwrap();
+        let result = client.invoke(&method, msg).await.unwrap();
+        assert_eq!(
+            field_str(result.message.as_ref().unwrap(), "message"),
+            "uds"
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_a_unary_rpc_through_a_socks5_proxy() {
+        calls_a_unary_rpc_through_a_proxy(ProxyKind::Socks5).await;
+    }
+
+    #[tokio::test]
+    async fn calls_a_unary_rpc_through_a_socks4_proxy() {
+        calls_a_unary_rpc_through_a_proxy(ProxyKind::Socks4).await;
+    }
+
+    #[tokio::test]
+    async fn calls_a_unary_rpc_through_an_http_proxy() {
+        calls_a_unary_rpc_through_a_proxy(ProxyKind::Http).await;
+    }
+
+    /// Calls a method of the test server through a proxy.
+    async fn calls_a_unary_rpc_through_a_proxy(kind: ProxyKind) {
+        let ts = spawn().await;
+        let proxy = spawn_proxy(kind).await;
+
+        let idl = evans::idl::Idl::from_pool(pool());
+        let method = idl.method("test.APIService", "Unary").unwrap();
+        let msg = request_message(&idl, "test.APIService", "Unary", "proxied");
+
+        let server = evans::config::ServerConfig {
+            host: ts.addr.ip().to_string(),
+            port: ts.addr.port().to_string(),
+            proxy: format!("{}://127.0.0.1:{}", kind.scheme(), proxy.port()),
+            ..Default::default()
+        };
+
+        let mut client =
+            evans::grpc::Client::new(&server, &evans::config::RequestConfig::default())
+                .await
+                .unwrap();
+        let result = client
+            .invoke(&method, msg)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        assert_eq!(
+            field_str(result.message.as_ref().unwrap(), "message"),
+            "proxied"
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_a_tls_rpc_through_a_proxy() {
+        let ts = spawn_with_tls(true).await;
+        let proxy = spawn_proxy(ProxyKind::Socks5).await;
+
+        let idl = evans::idl::Idl::from_pool(pool());
+        let method = idl.method("test.APIService", "Unary").unwrap();
+        let msg = request_message(&idl, "test.APIService", "Unary", "secure");
+
+        let server = evans::config::ServerConfig {
+            host: ts.addr.ip().to_string(),
+            port: ts.addr.port().to_string(),
+            tls: true,
+            insecure: true,
+            proxy: format!("socks5://127.0.0.1:{}", proxy.port()),
+            ..Default::default()
+        };
+
+        // The TLS handshake happens over the tunnel of the proxy, so the
+        // certificate of the server is still verified.
+        let mut client =
+            evans::grpc::Client::new(&server, &evans::config::RequestConfig::default())
+                .await
+                .unwrap();
+        let result = client.invoke(&method, msg).await.unwrap();
+        assert_eq!(
+            field_str(result.message.as_ref().unwrap(), "message"),
+            "secure"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_untrusted_certificate_is_accepted_with_insecure() {
+        let ts = spawn_with_tls(true).await;
+        let idl = evans::idl::Idl::from_pool(pool());
+        let method = idl.method("test.APIService", "Unary").unwrap();
+        let msg = request_message(&idl, "test.APIService", "Unary", "secure");
+
+        let server = evans::config::ServerConfig {
+            host: ts.addr.ip().to_string(),
+            port: ts.addr.port().to_string(),
+            tls: true,
+            insecure: true,
+            ..Default::default()
+        };
+
+        // The certificate of the server is neither trusted nor issued for the host,
+        // but the verification is turned off.
+        let mut client =
+            evans::grpc::Client::new(&server, &evans::config::RequestConfig::default())
+                .await
+                .unwrap();
         let result = client.invoke(&method, msg).await.unwrap();
         assert_eq!(
             field_str(result.message.as_ref().unwrap(), "message"),
@@ -368,11 +739,11 @@ mod invoke {
     #[tokio::test]
     async fn tls_untrusted_certificate_is_rejected() {
         let ts = spawn_with_tls(true).await;
-        let idl = evans2::idl::Idl::from_pool(pool());
+        let idl = evans::idl::Idl::from_pool(pool());
         let method = idl.method("test.APIService", "Unary").unwrap();
         let msg = request_message(&idl, "test.APIService", "Unary", "secure");
 
-        let server = evans2::config::ServerConfig {
+        let server = evans::config::ServerConfig {
             host: ts.addr.ip().to_string(),
             port: ts.addr.port().to_string(),
             tls: true,
@@ -381,7 +752,7 @@ mod invoke {
 
         // The client connects lazily, so the certificate error appears at the call.
         let mut client =
-            evans2::grpc::Client::new(&server, &evans2::config::RequestConfig::default())
+            evans::grpc::Client::new(&server, &evans::config::RequestConfig::default())
                 .await
                 .unwrap();
         let err = client.invoke(&method, msg).await.unwrap_err();
@@ -445,6 +816,74 @@ mod cli {
 
         assert_eq!(code, 0, "stderr: {stderr}");
         assert!(stdout.contains(r#""message": "ktr""#), "{stdout}");
+    }
+
+    #[tokio::test]
+    async fn calls_a_unary_rpc_over_a_unix_socket() {
+        let _ts = spawn_with_unix_socket("uds-cli").await;
+        let (stdout, stderr, code) = run(
+            &[
+                "--proto",
+                "testdata/proto/test.proto",
+                "--unix-socket",
+                unix_socket_path("uds-cli").to_str().unwrap(),
+                "cli",
+                "call",
+                "test.APIService.Unary",
+            ],
+            r#"{"name": "ktr"}"#,
+        )
+        .await;
+        assert!(stdout.contains("ktr"), "{stdout} {stderr}");
+        assert_eq!(code, 0, "{stdout} {stderr}");
+    }
+
+    #[tokio::test]
+    async fn calls_a_unary_rpc_through_a_proxy() {
+        let ts = spawn().await;
+        let proxy = spawn_proxy(ProxyKind::Socks5).await;
+        let (stdout, stderr, code) = run(
+            &[
+                "--proto",
+                "testdata/proto/test.proto",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &ts.addr.port().to_string(),
+                "--proxy",
+                &format!("socks5://127.0.0.1:{}", proxy.port()),
+                "cli",
+                "call",
+                "test.APIService.Unary",
+            ],
+            r#"{"name": "ktr"}"#,
+        )
+        .await;
+        assert!(stdout.contains("ktr"), "{stdout} {stderr}");
+        assert_eq!(code, 0, "{stdout} {stderr}");
+    }
+
+    #[tokio::test]
+    async fn calls_a_tls_rpc_with_the_insecure_option() {
+        let ts = spawn_with_tls(true).await;
+        // The insecure option implies TLS, so the certificate of the server is not
+        // verified and the call succeeds.
+        let (stdout, stderr, code) = run(
+            &[
+                "--proto",
+                "testdata/proto/test.proto",
+                "--port",
+                &ts.addr.port().to_string(),
+                "--insecure",
+                "cli",
+                "call",
+                "test.APIService.Unary",
+            ],
+            r#"{"name": "ktr"}"#,
+        )
+        .await;
+        assert!(stdout.contains("ktr"), "{stdout} {stderr}");
+        assert_eq!(code, 0, "{stdout} {stderr}");
     }
 
     #[tokio::test]
@@ -817,7 +1256,7 @@ mod cli {
 }
 
 mod message {
-    use evans2::message::{self, JsonOptions};
+    use evans::message::{self, JsonOptions};
     use prost_reflect::{DescriptorPool, DynamicMessage, Value};
 
     use super::*;
@@ -834,7 +1273,7 @@ mod message {
     #[tokio::test]
     async fn json_request_is_sent_and_response_is_rendered() {
         let ts = spawn().await;
-        let idl = evans2::idl::Idl::from_pool(pool());
+        let idl = evans::idl::Idl::from_pool(pool());
         let method = idl.method("test.APIService", "Unary").unwrap();
 
         let msg = message::from_json(
@@ -849,13 +1288,13 @@ mod message {
         )
         .unwrap();
 
-        let server = evans2::config::ServerConfig {
+        let server = evans::config::ServerConfig {
             host: ts.addr.ip().to_string(),
             port: ts.addr.port().to_string(),
             ..Default::default()
         };
         let mut client =
-            evans2::grpc::Client::new(&server, &evans2::config::RequestConfig::default())
+            evans::grpc::Client::new(&server, &evans::config::RequestConfig::default())
                 .await
                 .unwrap();
 
@@ -948,8 +1387,8 @@ mod repl {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    use evans2::message::filler::{FillError, Prompter};
-    use evans2::repl::session::Session;
+    use evans::message::filler::{FillError, Prompter};
+    use evans::repl::session::Session;
 
     use super::*;
 
@@ -1030,12 +1469,12 @@ mod repl {
         selections: &[usize],
         headers: &[(&str, &str)],
     ) -> anyhow::Result<ReplOutput> {
-        let mut cfg = evans2::config::Config {
-            default: evans2::config::DefaultConfig {
+        let mut cfg = evans::config::Config {
+            default: evans::config::DefaultConfig {
                 proto_path: vec![".".to_string()],
                 proto_file: vec!["testdata/proto/test.proto".to_string()],
             },
-            server: evans2::config::ServerConfig {
+            server: evans::config::ServerConfig {
                 host: ts.addr.ip().to_string(),
                 port: ts.addr.port().to_string(),
                 ..Default::default()
@@ -1052,16 +1491,16 @@ mod repl {
             let fds = protox::compile(["testdata/proto/test.proto"], ["testdata/proto"]).unwrap();
             prost_reflect::DescriptorPool::from_file_descriptor_set(fds).unwrap()
         };
-        let idl = evans2::idl::Idl::from_pool(pool);
+        let idl = evans::idl::Idl::from_pool(pool);
 
-        let mut client = evans2::grpc::Client::new(&cfg.server, &cfg.request)
+        let mut client = evans::grpc::Client::new(&cfg.server, &cfg.request)
             .await
             .unwrap();
 
         let session = ScriptedSession::new(lines, answers, selections);
         let out: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let err: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut repl = evans2::repl::Repl::with_writers(
+        let mut repl = evans::repl::Repl::with_writers(
             &cfg,
             &idl,
             &mut client,

@@ -410,8 +410,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "evans2"
-version = "0.1.0"
+name = "evans"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -421,15 +421,19 @@ dependencies = [
  "figment",
  "futures",
  "http",
+ "hyper-util",
  "prost",
  "prost-build",
  "prost-reflect",
  "protox",
  "reedline",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml 1.2.1+spec-1.1.0",
  "tonic",
@@ -437,6 +441,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
+ "tower-service",
 ]
 
 [[package]]

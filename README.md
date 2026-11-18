@@ -87,10 +87,13 @@ written to stdout before the error, like the original does.
 | `--path` | comma-separated proto file search paths |
 | `--proto` | comma-separated proto file names |
 | `--host` | gRPC server host |
+| `--unix-socket` | the path of the unix domain socket of the server |
 | `--port`, `-p` | gRPC server port |
 | `--header` | default header (`key=value`), repeatable |
 | `--reflection`, `-r` | use gRPC server reflection |
 | `--tls`, `-t` | use a secure TLS connection |
+| `--insecure` | do not verify the certificate of the server (implies TLS) |
+| `--proxy` | the address of the proxy that the connection goes through |
 | `--cacert` | the CA certificate file |
 | `--cert` / `--certkey` | the client certificate and key for mutual TLS |
 | `--servername` | override the server name used to verify the hostname |
@@ -98,6 +101,22 @@ written to stdout before the error, like the original does.
 
 The boolean flags are switches: they take no value, so `--reflection` turns the
 reflection on and the absence of the flag leaves it as the configuration says.
+
+`--insecure` turns the verification of the certificate of the server off. The
+connection is still encrypted, but it is not authenticated, so it is vulnerable to a
+man-in-the-middle attack. The CA certificate is ignored in that mode.
+
+`--unix-socket` connects to the server through a unix domain socket instead of a TCP
+connection. It takes precedence over the host and the port, and TLS is not available
+over it.
+
+`--proxy` sends the connection through a proxy. The scheme of the address selects the
+protocol of the proxy: `http` for a proxy that tunnels the connection with the HTTP
+CONNECT method, `socks5` and `socks4` for the SOCKS proxies. The credentials of the
+proxy may be part of the address, like `socks5://user:password@127.0.0.1:1080`. When
+the address is not given, the `ALL_PROXY` and `HTTPS_PROXY` environment variables are
+used. The TLS handshake happens over the tunnel of the proxy, so the certificate of
+the server is verified against the server itself.
 
 ## Configuration
 
@@ -128,9 +147,12 @@ historySize = 100
 [server]
 host = "127.0.0.1"
 port = "50051"
+unixSocket = ""
 reflection = false
 tls = false
 name = ""
+insecure = false
+proxy = ""
 
 [log]
 prefix = "evans: "
@@ -145,6 +167,21 @@ grpc-client = ["evans"]
 ```
 
 ## Development
+
+The common tasks are wrapped in a [justfile](https://github.com/casey/just), so
+`just` lists them:
+
+```console
+$ just            # the checks of the CI: the linter and the tests
+$ just test       # unit tests and the end-to-end suite
+$ just test-e2e   # the end-to-end suite only
+$ just lint       # cargo clippy --all-targets -- -D warnings
+$ just fmt        # cargo fmt
+$ just repl       # the REPL against the test proto
+$ just ci         # the formatting, the linter and the tests
+```
+
+The same commands work without `just`:
 
 ```console
 $ cargo test          # unit tests and the end-to-end suite

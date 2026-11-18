@@ -1,4 +1,6 @@
 pub mod codec;
+pub mod proxy;
+pub mod tls;
 
 use std::collections::BTreeMap;
 use std::error::Error as _;
@@ -23,11 +25,18 @@ pub async fn connect(
     server: &ServerConfig,
     request: &RequestConfig,
 ) -> Result<tonic::transport::Channel> {
-    let endpoint = endpoint(server, request)?;
-    endpoint
-        .connect()
-        .await
-        .context("failed to dial to gRPC server")
+    match connection(server, request)? {
+        Connection::Endpoint(endpoint) => endpoint
+            .connect()
+            .await
+            .context("failed to dial to gRPC server"),
+        Connection::Proxy {
+            connector,
+            endpoint,
+        } => tonic::transport::Channel::connect(connector, endpoint)
+            .await
+            .context("failed to dial to gRPC server"),
+    }
 }
 
 /// Creates a channel that connects lazily, like `grpc.DialContext` does.
@@ -35,24 +44,93 @@ pub fn connect_lazy(
     server: &ServerConfig,
     request: &RequestConfig,
 ) -> Result<tonic::transport::Channel> {
-    let endpoint = endpoint(server, request)?;
-    Ok(endpoint.connect_lazy())
+    match connection(server, request)? {
+        Connection::Endpoint(endpoint) => Ok(endpoint.connect_lazy()),
+        Connection::Proxy {
+            connector,
+            endpoint,
+        } => Ok(tonic::transport::Channel::new(connector, endpoint)),
+    }
 }
 
-fn endpoint(server: &ServerConfig, request: &RequestConfig) -> Result<Endpoint> {
+/// The way the client connects to the server.
+enum Connection {
+    /// The connection goes through the connector of the endpoint of tonic, which
+    /// supports the unix domain sockets.
+    Endpoint(Endpoint),
+    /// The connection goes through a proxy.
+    Proxy {
+        connector: Box<proxy::ProxyConnector>,
+        endpoint: Endpoint,
+    },
+}
+
+/// Builds the connection of the client.
+fn connection(server: &ServerConfig, request: &RequestConfig) -> Result<Connection> {
+    // A unix domain socket has neither TLS nor a proxy.
+    if !server.unix_socket.is_empty() {
+        if server.tls {
+            anyhow::bail!(
+                "the TLS connection is not supported over the unix domain socket '{}'",
+                server.unix_socket
+            );
+        }
+        let addr = format!("unix://{}", server.unix_socket);
+        let endpoint = Endpoint::from_shared(addr)
+            .context("failed to build the unix domain socket address")?
+            .connect_timeout(CONNECT_TIMEOUT);
+        return Ok(Connection::Endpoint(endpoint));
+    }
+
     let scheme = if server.tls { "https" } else { "http" };
     let addr = format!("{scheme}://{}:{}", server.host, server.port);
-    let mut endpoint = Endpoint::from_shared(addr)
+    let endpoint = Endpoint::from_shared(addr)
         .context("failed to build endpoint address")?
         .connect_timeout(CONNECT_TIMEOUT);
 
-    if server.tls {
-        let mut tls = ClientTlsConfig::new().with_native_roots();
-        if !request.ca_cert_file.is_empty() {
-            let b = std::fs::read(&request.ca_cert_file)
-                .context("failed to read the CA certificate")?;
-            tls = tls.ca_certificate(Certificate::from_pem(b));
+    // The proxy needs its own connector, because the TLS of the connection is
+    // negotiated over the tunnel of the proxy.
+    if let Some(proxy) = proxy::parse(&server.proxy)? {
+        let tls = if server.tls {
+            Some(tls_params(server, request).client_config()?)
+        } else {
+            None
+        };
+        let mut connector = proxy.connector(tls)?;
+        if !server.name.is_empty() {
+            connector = connector.with_domain(server.name.clone());
         }
+        return Ok(Connection::Proxy {
+            connector: Box::new(connector),
+            endpoint,
+        });
+    }
+
+    Ok(Connection::Endpoint(endpoint_with_tls(
+        server, request, endpoint,
+    )?))
+}
+
+/// Configures the TLS of the endpoint.
+fn endpoint_with_tls(
+    server: &ServerConfig,
+    request: &RequestConfig,
+    mut endpoint: Endpoint,
+) -> Result<Endpoint> {
+    if server.tls {
+        // The verifier of the certificate of the server is replaced when the
+        // verification is turned off. The roots and the CA certificate are not set in
+        // that case, because a custom verifier conflicts with them.
+        let mut tls = ClientTlsConfig::new();
+        if !server.insecure {
+            tls = tls.with_native_roots();
+            if !request.ca_cert_file.is_empty() {
+                let b = std::fs::read(&request.ca_cert_file)
+                    .context("failed to read the CA certificate")?;
+                tls = tls.ca_certificate(Certificate::from_pem(b));
+            }
+        }
+
         if !request.cert_file.is_empty() && !request.cert_key_file.is_empty() {
             let cert = std::fs::read(&request.cert_file)
                 .context("failed to read the client certificate")?;
@@ -63,12 +141,30 @@ fn endpoint(server: &ServerConfig, request: &RequestConfig) -> Result<Endpoint> 
         if !server.name.is_empty() {
             tls = tls.domain_name(server.name.clone());
         }
-        endpoint = endpoint
-            .tls_config(tls)
-            .context("failed to configure TLS")?;
+
+        endpoint = if server.insecure {
+            endpoint
+                .tls_config_with_verifier(tls, tls::SkipServerVerification::shared())
+                .context("failed to configure TLS")?
+        } else {
+            endpoint
+                .tls_config(tls)
+                .context("failed to configure TLS")?
+        };
     }
 
     Ok(endpoint)
+}
+
+/// The parameters of the TLS connection of the client.
+fn tls_params(server: &ServerConfig, request: &RequestConfig) -> tls::TlsParams {
+    tls::TlsParams {
+        ca_cert_file: request.ca_cert_file.clone(),
+        cert_file: request.cert_file.clone(),
+        cert_key_file: request.cert_key_file.clone(),
+        domain: server.name.clone(),
+        insecure: server.insecure,
+    }
 }
 
 /// The name of the header that carries the deadline of a call.

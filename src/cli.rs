@@ -45,9 +45,12 @@ fn merge_common(root: &Common, sub: &Common) -> Common {
         proto: merged_vec(&root.proto, &sub.proto),
         host: sub.host.clone().or_else(|| root.host.clone()),
         port: sub.port.clone().or_else(|| root.port.clone()),
+        unix_socket: sub.unix_socket.clone().or_else(|| root.unix_socket.clone()),
+        proxy: sub.proxy.clone().or_else(|| root.proxy.clone()),
         header: merged_vec(&root.header, &sub.header),
         reflection: sub.reflection || root.reflection,
         tls: sub.tls || root.tls,
+        insecure: sub.insecure || root.insecure,
         cacert: sub.cacert.clone().or_else(|| root.cacert.clone()),
         cert: sub.cert.clone().or_else(|| root.cert.clone()),
         certkey: sub.certkey.clone().or_else(|| root.certkey.clone()),
@@ -132,6 +135,18 @@ pub struct Common {
     /// gRPC server host
     #[arg(long, value_name = "HOST")]
     pub host: Option<String>,
+    /// the path of the unix domain socket of the server
+    ///
+    /// It takes precedence over the host and the port.
+    #[arg(long, value_name = "PATH")]
+    pub unix_socket: Option<String>,
+    /// the address of the proxy that the connection goes through
+    ///
+    /// The scheme of the address selects the protocol of the proxy: `http` for a
+    /// proxy that tunnels with the HTTP CONNECT method, `socks5` and `socks4` for the
+    /// SOCKS proxies. The credentials may be part of the address.
+    #[arg(long, value_name = "URL")]
+    pub proxy: Option<String>,
     /// gRPC server port
     #[arg(short = 'p', long, value_name = "PORT")]
     pub port: Option<String>,
@@ -144,6 +159,12 @@ pub struct Common {
     /// use a secure TLS connection
     #[arg(short = 't', long)]
     pub tls: bool,
+    /// do not verify the certificate of the server
+    ///
+    /// The connection is still encrypted, but it is not authenticated. The CA
+    /// certificate is ignored, because the verification is turned off.
+    #[arg(long)]
+    pub insecure: bool,
     /// the CA certificate file for verifying the server
     #[arg(long, value_name = "FILE")]
     pub cacert: Option<PathBuf>,
